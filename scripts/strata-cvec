@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""Manually switch the control vector on this installation, reloading just its own user unit."""
+import argparse
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0,str(Path(__file__).resolve().parent))
+from native import root, config, api
+
+unit = "strata-fp4-local.service"
+
+
+def view():
+    live = api("/metrics")
+    return {"loaded":api("/health")["loaded"], "cvec":str(live["engine"].get("cvec")),
+            "state":live["live"]["state"], "queued":live["live"]["queued"],
+            "in_flight":api("/v1/status")["activity"]["in_flight"]}
+
+
+def write(path, data):
+    with tempfile.NamedTemporaryFile(dir=path.parent,delete=False) as f:
+        f.write(data)
+    os.replace(f.name,path)
+
+
+def main(mode):
+    if mode=="status":
+        print(json.dumps(view()))
+        return
+    working = subprocess.check_output(["systemctl","--user","show",unit,"-p","WorkingDirectory","--value"],text=True).strip()
+    if Path(working).resolve()!=root:
+        raise RuntimeError("Unit does not belong to this checkout")
+    cfg=config()
+    flags=cfg["args"]
+    template=json.loads((root/"config/strata.template.json").read_text().replace("@ROOT@",str(root)))
+    vec=template["args"][template["args"].index("--control-vector-scaled"):]
+    path=root/"strata.json"
+    original=path.read_bytes()
+    present="--control-vector-scaled" in flags
+    if present and flags[-len(vec):]!=vec:
+        raise RuntimeError("Custom control vector settings detected; inspect strata.json")
+    initial=view()
+    current="project:4-44" if present else "0"
+    if not initial["loaded"] or initial["cvec"]!=current:
+        raise RuntimeError(f"Configured and live state disagree: {initial}")
+    if (mode=="on")==present:
+        print(json.dumps(initial))
+        return
+    if initial["state"]!="idle" or initial["queued"] or initial["in_flight"]:
+        raise RuntimeError("Active or queued requests; drain clients before switching")
+    cfg["args"] = flags+vec if mode=="on" else flags[:-len(vec)]
+    write(root/"runtime/before-cvec.json",original)
+    ctl=["systemctl","--user"]
+    subprocess.run(ctl+["stop",unit],check=True)
+    try:
+        write(path,(json.dumps(cfg,indent=2)+"\n").encode())
+        subprocess.run(ctl+["start",unit],check=True)
+        after=view()
+        if not after["loaded"] or after["cvec"]!=("project:4-44" if mode=="on" else "0"):
+            raise RuntimeError(f"New mode did not load: {after}")
+        print(json.dumps(after))
+    except BaseException:
+        subprocess.run(ctl+["stop",unit],check=True)
+        write(path,original)
+        subprocess.run(ctl+["start",unit],check=True)
+        restored=view()
+        if not restored["loaded"] or restored["cvec"]!=current:
+            raise RuntimeError(f"Rollback did not reach previous READY state: {restored}")
+        raise
+
+
+if __name__=="__main__":
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("mode",choices=["on","off","status"])
+    mode=parser.parse_args().mode
+    if mode=="status":
+        main(mode)
+    else:
+        with (root/"runtime/cvec.lock").open("a") as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            main(mode)

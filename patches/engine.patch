@@ -1,0 +1,2575 @@
+diff --git a/cmake/backends/cpu.cmake b/cmake/backends/cpu.cmake
+index bca4477..a35b887 100644
+--- a/cmake/backends/cpu.cmake
++++ b/cmake/backends/cpu.cmake
+@@ -249,6 +249,12 @@ macro(strata_cpu_native_experts)
+   else()
+     set_source_files_properties(src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/nvfp4_avx512.cpp PROPERTIES COMPILE_OPTIONS
+                                 "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mavx512vpopcntdq;-mbmi2;-mf16c;-mfma")
++    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$" AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
++      # Only NVFP4 uses this narrower ISA contract. All other formats keep their existing dispatch.
++      set_source_files_properties(src/kernels/cpu/nvfp4_avx512.cpp PROPERTIES COMPILE_OPTIONS
++                                  "-march=x86-64;-mtune=cascadelake;-mavx2;-mf16c;-mfma;-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mno-avx512vbmi;-mno-avx512vbmi2;-mno-avx512vpopcntdq")
++      set_property(SOURCE src/kernels/cpu/native_expert.cpp APPEND PROPERTY COMPILE_DEFINITIONS STRATA_NVFP4_VNNI_NO_VBMI=1)
++    endif()
+     set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+     set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+     set_source_files_properties(src/kernels/cpu/nvfp4_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+diff --git a/cmake/strata_gpu_engine.cmake b/cmake/strata_gpu_engine.cmake
+index 03f6139..b886689 100644
+--- a/cmake/strata_gpu_engine.cmake
++++ b/cmake/strata_gpu_engine.cmake
+@@ -20,6 +20,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+   # linker error ("unresolved external symbol cudaGraphInstantiate") names the function rather than the cause.
+   target_link_libraries(strata_core PUBLIC strata_plan strata_warnings ${_strata_gpu_runtime_target})
+ 
++  if(STRATA_ENABLE_CUDA)
++    target_compile_definitions(strata_core PUBLIC STRATA_HAVE_BF16_KV=1)
++  endif()
++
+   add_executable(strata-device src/core/device_main.cpp)
+   target_link_libraries(strata-device PRIVATE strata_core)
+ 
+@@ -230,6 +234,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+     target_link_libraries(pa_bench PRIVATE strata_kernels CUDA::cudart)
+   endif()
+   # plan v0.3 P6: llama.cpp's block layouts and codebook grids for the i-quant formats (MIT, third_party/ggml)
++  if(STRATA_ENABLE_CUDA)
++    target_sources(strata_kernels PRIVATE src/kernels/cuda/kv_bf16.cu)
++  endif()
+   target_include_directories(strata_kernels PRIVATE third_party/ggml)
+   # Match the pinned llama.cpp CUDA arithmetic contract for this adapter only.
+   if(STRATA_ENABLE_CUDA)
+@@ -1266,6 +1273,46 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+   target_link_libraries(s_gemv_q8k_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+   add_test(NAME s_gemv_q8k_parity COMMAND s_gemv_q8k_parity --selftest)
+ 
++  if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
++    add_executable(bf16_state_test src/kernels/bf16_state_test.cpp)
++    target_include_directories(bf16_state_test PRIVATE ${_strata_gpu_include_directories})
++    target_link_libraries(bf16_state_test PRIVATE strata_engine ${_strata_gpu_runtime_target})
++    add_test(NAME bf16_state_test COMMAND bf16_state_test)
++    add_test(NAME bf16_pin_failure COMMAND bf16_state_test --pin-failure)
++    set_tests_properties(bf16_pin_failure PROPERTIES ENVIRONMENT "STRATA_TEST_PIN_BUDGET_MIB=1")
++    add_executable(bf16_bits_cuda src/kernels/bf16_bits_cuda.cu)
++    target_include_directories(bf16_bits_cuda PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
++    target_link_libraries(bf16_bits_cuda PRIVATE CUDA::cudart_static)
++    add_test(NAME bf16_bits_cuda COMMAND bf16_bits_cuda)
++    add_executable(bf16_cpu_test src/kernels/bf16_cpu_test.cpp)
++    target_include_directories(bf16_cpu_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
++    add_test(NAME bf16_cpu_test COMMAND bf16_cpu_test)
++    add_executable(bf16_cuda_test src/kernels/bf16_cuda_test.cpp)
++    target_include_directories(bf16_cuda_test PRIVATE ${_strata_gpu_include_directories})
++    target_link_libraries(bf16_cuda_test PRIVATE strata_prefill strata_kernels ${_strata_gpu_runtime_target})
++    add_test(NAME bf16_cuda_test COMMAND bf16_cuda_test)
++    add_test(NAME bf16_attention_2051 COMMAND bf16_cuda_test --attention-2051)
++    add_test(NAME bf16_prompt_4096 COMMAND bf16_cuda_test --prompt-4096)
++    add_test(NAME bf16_prompt_tc COMMAND bf16_cuda_test)
++    set_tests_properties(bf16_prompt_tc PROPERTIES ENVIRONMENT "STRATA_BF16_PREFILL_TC=1")
++    find_package(Python3 COMPONENTS Interpreter REQUIRED)
++    add_test(NAME bf16_fail_closed COMMAND ${Python3_EXECUTABLE}
++             ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_bf16_fail_closed.py $<TARGET_FILE:strata> $<TARGET_FILE:bf16_cuda_test>)
++    # These context-only synthetic cases need no downloaded drafter pack.
++    set_property(TARGET dflash2_ring_test PROPERTY EXCLUDE_FROM_ALL FALSE)
++    add_test(NAME bf16_dflash2_state COMMAND ${Python3_EXECUTABLE}
++             ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_dflash2_bf16.py --binary $<TARGET_FILE:dflash2_ring_test>)
++    set_tests_properties(bf16_dflash2_state PROPERTIES TIMEOUT 600)
++    add_test(NAME bf16_dflash2_race_smoke COMMAND ${Python3_EXECUTABLE}
++             ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_dflash2_bf16.py --binary $<TARGET_FILE:dflash2_ring_test> --race-smoke)
++    set_tests_properties(bf16_dflash2_race_smoke PROPERTIES TIMEOUT 120)
++    add_test(NAME dflash2_fp32_legacy COMMAND ${Python3_EXECUTABLE}
++             ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_dflash2_bf16.py --binary $<TARGET_FILE:dflash2_ring_test> --legacy)
++    set_tests_properties(dflash2_fp32_legacy PROPERTIES TIMEOUT 600)
++    add_test(NAME bf16_stream_parity COMMAND kv_stream_parity --bf16)
++    add_test(NAME bf16_stream_262144 COMMAND kv_stream_parity --bf16-long)
++  endif()
++
+   add_executable(qsa_parity src/kernels/qsa_parity.cpp)
+   target_include_directories(qsa_parity PRIVATE ${_strata_gpu_include_directories})
+   target_link_libraries(qsa_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+diff --git a/docs/T5820_BF16.md b/docs/T5820_BF16.md
+new file mode 100644
+index 0000000..8f28a15
+--- /dev/null
++++ b/docs/T5820_BF16.md
+@@ -0,0 +1,102 @@
++# T5820 CUDA BF16 KV prototype
++
++Base: `13eedf552417a6a791a7d13c6597e24300ee3a09`. This is an isolated development branch,
++not the installed Strata engine. No model weights are needed for its tests.
++
++`--kv bf16` selects storage ID 4, distinct from FP16 ID 0. Decode and prompt writers
++round FP32 directly to BF16 with round-to-nearest-even. NaNs stay quiet NaNs; signed
++zero, infinity and subnormals are retained according to BF16 rounding. Gather,
++host backing, residency copies, staging and ring restore move the raw bits.
++The existing FP16 and quantized paths retain their defaults.
++
++`KvStorage` is passed in shapes, state and pool descriptors. The process policy is
++set once before state creation; changing it while sessions or graphs exist is
++unsupported. An incompatible descriptor, cache format or configuration must fail.
++The existing session v1 layout already carries a format ID for every KV image and
++the configuration hash includes `kv`. ID 4 extends that enum without changing the
++file layout. FP16/BF16 image restoration in either direction is rejected.
++
++The default BF16 attention kernel loads BF16 as FP32 and uses FP32 online softmax.
++`STRATA_BF16_PREFILL_TC=1` opts into the experimental prompt kernel: BF16 Tensor Core
++QK with FP32 accumulation, then FP32 softmax and PV. Q is represented as BF16 high
++and residual components. K/V never pass through FP16. This path requires sm_80+
++and Flash-Next's 12 query heads per KV head. It is not a measured speed claim;
++the scalar implementation remains the default and the numerical reference.
++
++The CPU test oracle uses arithmetic scaling and ties-to-even, independently of the
++production bit-add encoder. CUDA conversion is also compared with NVIDIA's BF16
++intrinsic. Attention uses an independent FP64 oracle over BF16-rounded K/V.
++Frozen tolerances: each output error <= `1e-4 + 2e-3 * abs(reference)` and normalized
++RMS <= `1e-3`. The large V sentinel is 131072; therefore report relative/RMS errors
++alongside maximum absolute error.
++
++The model-free tests are:
++
++- `bf16_cpu_test`, `bf16_bits_cuda`: all BF16 encodings, tie neighbors and seeded FP32 bits.
++- `bf16_cuda_test`, `bf16_prompt_tc`: page sizes 1/4/512, permuted pages, chunks
++  1/17/4096, direct/batched append, host/stage/gather bits, both attention paths,
++  verification row dispatch, graph capture/replay with changed device step data.
++- `bf16_attention_2051`: full selection width against independent attention.
++- `bf16_prompt_4096`: 4096 causal query rows, each selecting at most 17 cells.
++  This tests batch sizing; it is not a full model prompt.
++- `bf16_stream_parity`, `bf16_stream_262144`: 32768 resident cells with 40000 or
++  262144 logical cells in one synthetic layer, CLOCK eviction, byte comparisons,
++  streaming graph replay after invalidation, and ring restore.
++- `bf16_state_test`: actual state allocation and MTP KV primitives with accept,
++  reject, partial commit, EOS/output limits, overwrite and ring restoration.
++  It does not run the weight-dependent MtpDrafter or Verifier.
++- `bf16_pin_failure`: real guarded pinned allocation with a 1 MiB injected limit,
++  including the host registration route. No residency/dtype fallback.
++- `bf16_fail_closed`: wrong pool dtype, unknown format and unsupported CLI combinations.
++- Extended conversation tests: BF16 snapshot/session metadata, restoration and
++  cross-dtype rejection. Existing FP16/INT8/Q4/hybrid tests remain regression checks.
++
++Unsupported combinations are rejected: batch slots, multi-GPU,
++elastic KV, rotated KV and native short FP16 attention. The separate setup/Terminal
++launchers do not expose BF16; use this engine only for approved prototype work.
++HIP, SYCL and Metal BF16 are not implemented or qualified.
++
++MTP shares the new append/read/ring functions. Its pinned allocation failure now
++ends BF16 initialization instead of switching to a fully resident cache. Rejected
++draft bytes can remain beyond the committed cursor, as upstream; selection bounds
++exclude them and subsequent writes replace them. Full MTP logits, acceptance,
++GDN/indexer commit integration and real conversation continuation require weights
++and are NOT RUN in this phase.
++
++DFlash2 currently has its own FP32 ring (5 default layers, 8 KV heads, dimension
++128, 2064 cells), FP32 temporary block K/V and a quantized feature history log.
++It is not BF16 merely because the target model uses BF16. Phase 2-B.1 permits
++`--kv bf16 --draft auto` with both drafter assets, `--spec >= 2` and an MTP fallback.
++The startup message explicitly reports target/MTP BF16 and DFlash2 FP32. Its own
++ring, block K/V, taps and feature scales retain their FP32 arithmetic; the feature
++log still uses INT8 codes and FP32 scales. No DFlash2 tensor aliases main KV.
++Strict BF16 target mode rejects drafter initialization and ring rebuild failures,
++and cross-target-dtype state copies. It does not silently load only MTP after a
++failed DFlash2 load. Legacy FP16 fallback behavior is retained. Session files
++persist main BF16 images with dtype ID 4; DFlash2 history is process-local and is
++not serialized as BF16. A session restored without its draft history may explicitly
++report a cold draft ring, whose proposals still require target verification.
++
++`bf16_dflash2_state` creates a 62,682,681-byte synthetic context-only pack in a
++temporary directory. It exercises real context projection, FP32 ring writes,
++lineage rewind/parking/branching/eviction, state copying, deferred tap replay,
++graph capture/replay, allocation errors, and unchanged BF16 main host/device
++sentinels. The fixture omits block/head/selector tensors; full draft inference and
++the request-level auto bandit are NOT RUN. Deferred 4+4-row and direct 8-row context updates must match bitwise. The inherited
++test fixture's default-stream pageable upload was corrected to use the drafter's
++nonblocking stream, so the consumer cannot read an unfinished upload. MTP KV
++mechanism tests remain required.
++`bf16_dflash2_race_smoke` exercises context/copy/graph and accepted/rejected
++prefixes with fewer than 64 projected rows, for resource-bounded shared-memory
++racecheck. Long lineage/rewind tests remain separate normal and memcheck cases.
++The T5820 validation runner limits racecheck to one worker, 100000 nonzero hazard
++records, a 6 GiB process-group RSS ceiling and an 8 GiB host-availability floor.
++Unbounded long-fixture racecheck exhausted the 64GB host and is not qualified.
++Shared-memory racecheck does not establish global DMA ordering; the explicit
++same-stream upload and bitwise regressions cover that boundary.
++Separate DFlash2/MTP hardware A/B tests decide performance after model approval.
++
++The T5820 delivery directory records toolchain/package hashes, build commands,
++binary hashes, executed test logs, sanitizer reports, and remaining resource gates.
++Synthetic success never qualifies IQ3_S at 256K. Model downloads, real inference,
++API deployment and the physical 96GB upgrade remain separate stages.
+diff --git a/include/strata/core/dflash2.hpp b/include/strata/core/dflash2.hpp
+index 5fbf175..a95e34b 100644
+--- a/include/strata/core/dflash2.hpp
++++ b/include/strata/core/dflash2.hpp
+@@ -18,6 +18,7 @@
+ #include <cstdlib>
+ 
+ #include "strata/core/session.hpp"
++#include "strata/kernels/kv_dtype.hpp"
+ 
+ #include <cuda_runtime.h>
+ 
+@@ -41,6 +42,23 @@ public:
+     static constexpr int kRing2048 = 2048;    ///< positions the deferred-rows buffer holds
+     static constexpr int kRing = 2064;        ///< K/V slots per layer: the 2048 window + slack for rows written ahead of a rejection
+ 
++    // Main/MTP KV and the draft ring have independent precision contracts. Set before load.
++    // Strict BF16 target mode propagates resource/rebuild errors instead of starting a cold ring.
++    bool set_target_kv_storage(kernels::KvStorage storage) {
++        if (static_cast<unsigned>(storage) > static_cast<unsigned>(kernels::KvStorage::Bf16)) {
++            state_error_ = "dflash2: invalid target KV dtype"; return false;
++        }
++        if (device_ >= 0 && storage != target_storage_) {
++            state_error_ = "dflash2: target KV dtype is immutable after load"; return false;
++        }
++        target_storage_ = storage; return true;
++    }
++    kernels::KvStorage target_kv_storage() const { return target_storage_; }
++    static constexpr const char* ring_dtype() { return "fp32"; }
++    const std::string& state_error() const { return state_error_; }
++    uint64_t ring_bytes() const { return uint64_t(L_) * 2 * kRing * NKV_ * HD_ * sizeof(float); }
++    uint64_t deferred_bytes() const { return dpend_ ? uint64_t(kRing2048) * taps_.size() * N_ * sizeof(float) : 0; }
++
+     Dflash2Drafter() = default;
+     ~Dflash2Drafter();
+     Dflash2Drafter(const Dflash2Drafter&) = delete;
+@@ -118,9 +136,6 @@ public:
+     /// Allocates the log's pinned staging and turns the log on (STRATA_DF2_RING_LOG=0 keeps it off). alloc() calls it; a clone that skips alloc() calls it after its
+     /// own allocation, on its device. Without it the log stays off and begin_request uses the pre-log rule.
+     void init_ring_log();
+-    /// A request moves between two drafters whose rings were copied on the device (solo <-> a --parallel slot): the host side goes with it. The lineage's log is
+-    /// shared copy-on-write, the tag shadow and the epoch are copied (the caller copies kring_/vring_/tag_ on the device).
+-    void copy_log_state_from(const Dflash2Drafter& src);
+     uint64_t ring_log_bytes() const;     ///< host bytes of the live lineage's log
+     uint64_t ring_stash_bytes() const;   ///< host bytes of the parked lineages
+     uint64_t ring_scratch_bytes() const { return rb_bytes_; }   ///< VRAM of the rebuild scratch (0 until the first rebuild)
+@@ -165,6 +180,11 @@ public:
+     int64_t rounds = 0;
+ 
+ private:
++    // Only copy_state_from may pair this COW history copy with its dtype-checked device-ring copy.
++    void copy_log_state_from(const Dflash2Drafter& src);
++    kernels::KvStorage target_storage_ = kernels::KvStorage::Fp16;
++    std::string state_error_;
++    bool strict_target() const { return target_storage_ == kernels::KvStorage::Bf16; }
+     struct Tensor { std::string name, dtype; int64_t rows = 0, cols = 0; uint64_t off = 0, bytes = 0; };
+     const Tensor& find(const std::string& name) const;
+     const void* q8(const std::string& name) const { return blob_ + find(name).off; }
+diff --git a/include/strata/core/layer.hpp b/include/strata/core/layer.hpp
+index 9e0361a..a84d341 100644
+--- a/include/strata/core/layer.hpp
++++ b/include/strata/core/layer.hpp
+@@ -207,6 +207,7 @@ bool layer_shared_early();
+ /// shorter than the sequence would have `rope_neox_apply` read past it, which is a wrong rotation rather than a
+ /// fault.
+ struct QsaState {
++    strata::kernels::KvStorage storage = strata::kernels::KvStorage::Fp16;
+     uint16_t* k_pool = nullptr;      ///< [page][kv_head][page_size][head_dim] fp16 (null in INT8 mode)
+     uint16_t* v_pool = nullptr;
+     /// Plan v0.3 P7: INT8 KV (qsa_set_kv_int8). Codes [page][kv_head][page_size][head_dim], one FP16 scale per 64.
+@@ -320,6 +321,7 @@ void qsa_set_kv_hybrid(bool enabled);
+ bool qsa_kv_hybrid();
+ /// The state's KV format for the block-moving functions of kv_stream.hpp (kKvF16 / kKvInt8 / kKvQ4 / kKvHybrid).
+ inline int qsa_kv_format(const QsaState& st) {
++    if (st.storage == strata::kernels::KvStorage::Bf16) return strata::kernels::kKvBf16;
+     if (st.kv_hybrid) return strata::kernels::kKvHybrid;   // K8V4: its own three runs (kv_stream.cu)
+     return st.kv_q4 ? strata::kernels::kKvQ4 : st.kv_int8 ? strata::kernels::kKvInt8 : strata::kernels::kKvF16;
+ }
+diff --git a/include/strata/core/layout.hpp b/include/strata/core/layout.hpp
+index e9a91f9..166d661 100644
+--- a/include/strata/core/layout.hpp
++++ b/include/strata/core/layout.hpp
+@@ -28,6 +28,7 @@ namespace strata::core {
+ /// kernels' own choice (`qsa_real_shapes`).
+ inline strata::kernels::QsaShapes qsa_shapes(const ModelGeometry& g) {
+     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
++    s.storage = strata::kernels::configured_kv_storage;
+     s.n_head = g.n_head;
+     s.n_head_kv = g.n_head_kv;
+     s.head_dim = g.head_dim;
+diff --git a/include/strata/kernels/cpu/nvfp4_avx512.hpp b/include/strata/kernels/cpu/nvfp4_avx512.hpp
+index d9ba296..b2af912 100644
+--- a/include/strata/kernels/cpu/nvfp4_avx512.hpp
++++ b/include/strata/kernels/cpu/nvfp4_avx512.hpp
+@@ -11,6 +11,9 @@
+ 
+ namespace strata::kernels::cpu {
+ 
++/// Runtime dispatch shared by the NVFP4 worker and its numerical test.
++bool nvfp4_use_512();
++
+ /// Whether rows of `n` values fit the kernels (whole 64-value blocks, at most 64 of them).
+ bool nvfp4_512_fits(int n);
+ 
+diff --git a/include/strata/kernels/kv_bf16.hpp b/include/strata/kernels/kv_bf16.hpp
+new file mode 100644
+index 0000000..894f09a
+--- /dev/null
++++ b/include/strata/kernels/kv_bf16.hpp
+@@ -0,0 +1,29 @@
++#pragma once
++#include "strata/kernels/qsa_decode_attn.hpp"
++#include <cstdio>
++#include <cstdlib>
++namespace strata::kernels {
++// Correctness-first FP32 attention over BF16 paged storage. No FP16 intermediates.
++// steps/ids are query-major; each query has kStepCount entries and cap IDs.
++#if defined(__HIPCC__)
++inline void kv_bf16_attention(const float*, const QsaAttnPools&, const int32_t*, const int32_t*, int64_t,
++                               const QsaShapes&, float*, int64_t, void*) {
++    std::fprintf(stderr,"BF16 KV prototype requires CUDA; no fallback\n"); std::exit(2);
++}
++#else
++void kv_bf16_attention(const float* q, const QsaAttnPools& pools, const int32_t* ids,
++                       const int32_t* steps, int64_t cap, const QsaShapes& shapes,
++                       float* output, int64_t queries, void* stream);
++#endif
++#if !defined(__HIPCC__)
++// Retained CUDA reference for bit-level scheduling regression.
++void kv_bf16_attention_reference(const float* q, const QsaAttnPools& pools, const int32_t* ids,
++                       const int32_t* steps, int64_t cap, const QsaShapes& shapes,
++                       float* output, int64_t queries, void* stream);
++// Experimental prefill: BF16 Tensor Core QK (Q_hi + Q_lo) with FP32 softmax/PV.
++// CUDA sm_80+, Flash-Next GQA=12, no FP16 intermediates. Explicit opt-in in dispatch.
++void kv_bf16_attention_tc(const float* q, const QsaAttnPools& pools, const int32_t* ids,
++                          const int32_t* steps, int64_t cap, const QsaShapes& shapes,
++                          float* output, int64_t queries, void* stream);
++#endif
++}
+diff --git a/include/strata/kernels/kv_dtype.hpp b/include/strata/kernels/kv_dtype.hpp
+new file mode 100644
+index 0000000..861d63f
+--- /dev/null
++++ b/include/strata/kernels/kv_dtype.hpp
+@@ -0,0 +1,47 @@
++#pragma once
++#include <cstdint>
++#include <cstring>
++
++namespace strata::kernels {
++// Stable wire IDs: never alias BF16 (4) with FP16 (0), despite equal element sizes.
++enum class KvStorage : uint8_t { Fp16 = 0, Int8 = 1, Q4 = 2, Hybrid = 3, Bf16 = 4 };
++// Startup-only policy. Kernels receive a value in their shapes/pools, not this variable.
++inline KvStorage configured_kv_storage = KvStorage::Fp16;
++inline bool parse_kv_storage(const char* name, KvStorage& out) {
++    if (!name) return false;
++    if (!std::strcmp(name,"fp16")) out=KvStorage::Fp16;
++    else if (!std::strcmp(name,"bf16")) out=KvStorage::Bf16;
++    else if (!std::strcmp(name,"int8")) out=KvStorage::Int8;
++    else if (!std::strcmp(name,"q4_0")) out=KvStorage::Q4;
++    else if (!std::strcmp(name,"k8v4")) out=KvStorage::Hybrid;
++    else return false;
++    return true;
++}
++inline bool valid_kv_storage(KvStorage s) { return static_cast<unsigned>(s) <= 4; }
++inline bool kv_is_16bit(KvStorage s) { return s==KvStorage::Fp16 || s==KvStorage::Bf16; }
++#if defined(__CUDACC__) || defined(__HIPCC__)
++#define STRATA_KV_HD __host__ __device__
++#else
++#define STRATA_KV_HD
++#endif
++// RNE directly from FP32. NaNs remain quiet NaNs, never round to infinity.
++STRATA_KV_HD inline uint16_t kv_bf16_encode(float x) {
++    uint32_t u;
++#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
++    u=__float_as_uint(x);
++#else
++    std::memcpy(&u,&x,4);
++#endif
++    if ((u & 0x7fffffffU)>0x7f800000U) return uint16_t((u>>16)|0x0040U);
++    return uint16_t((u + 0x7fffU + ((u>>16)&1U))>>16);
++}
++STRATA_KV_HD inline float kv_bf16_decode(uint16_t h) {
++    uint32_t u=uint32_t(h)<<16;
++#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
++    return __uint_as_float(u);
++#else
++    float f; std::memcpy(&f,&u,4); return f;
++#endif
++}
++#undef STRATA_KV_HD
++} // namespace strata::kernels
+diff --git a/include/strata/kernels/kv_stream.hpp b/include/strata/kernels/kv_stream.hpp
+index 8108795..f23e723 100644
+--- a/include/strata/kernels/kv_stream.hpp
++++ b/include/strata/kernels/kv_stream.hpp
+@@ -30,7 +30,7 @@ namespace strata::kernels {
+ /// The host copy of one layer's K/V: device-mapped pointers (UVA) into pinned memory, identity layout
+ /// `[block][kv_head][page_size][head_dim]`. All null when the layer is fully resident.
+ struct KvHostPools {
+-    uint16_t* k_pool = nullptr;   ///< fp16 mode
++    uint16_t* k_pool = nullptr;   ///< storage-tagged FP16/BF16 mode
+     uint16_t* v_pool = nullptr;
+     int8_t* k_q = nullptr;        ///< int8 mode: codes
+     int8_t* v_q = nullptr;
+@@ -38,6 +38,7 @@ struct KvHostPools {
+     uint16_t* v_scale = nullptr;
+     uint8_t* k_q4 = nullptr;      ///< q4_0 mode (kv_q4.hpp): block_q4_0 codes, 144 B per cell and head
+     uint8_t* v_q4 = nullptr;
++    KvStorage storage = KvStorage::Fp16;
+     bool present() const { return k_pool != nullptr || k_q != nullptr || k_q4 != nullptr; }
+ };
+ 
+@@ -45,7 +46,7 @@ struct KvHostPools {
+ /// K8V4 (`--kv k8v4`: K as int8 codes + scales, V as rotated q4_0 - three runs, `k_q`, `k_scale`, `v_q4`).
+ /// (A bool `int8` argument still reads as kKvF16 / kKvInt8.)  kKvHybrid is 3, the number conversation snapshots
+ /// already give K8V4.
+-enum KvFormat : int { kKvF16 = 0, kKvInt8 = 1, kKvQ4 = 2, kKvHybrid = 3 };
++enum KvFormat : int { kKvF16 = 0, kKvInt8 = 1, kKvQ4 = 2, kKvHybrid = 3, kKvBf16 = 4 };
+ 
+ /// K8V4's halves as the single-format append kernels see them, so a hybrid layer's host copy (and the prompt path's
+ /// staging pool) is written by the same calls that write its VRAM pools: K is "int8 whose V is K", V is "q4_0 whose
+diff --git a/include/strata/kernels/qsa.hpp b/include/strata/kernels/qsa.hpp
+index 8eb89e2..b2a9406 100644
+--- a/include/strata/kernels/qsa.hpp
++++ b/include/strata/kernels/qsa.hpp
+@@ -60,7 +60,7 @@
+ // ---- LAYOUTS.  Every one of these is a runtime buffer and not a weight, so the layout is a free choice - but
+ // it must be WRITTEN DOWN, because the alternatives index the same numbers and a mix-up is silent.
+ //
+-// K/V CACHE: FP16, paged, `[page][kv_head][page_size][head_dim]` with head_dim fastest.  The plan says "FP16
++// K/V CACHE: typed 16-bit (FP16 default, opt-in BF16), paged, `[page][kv_head][page_size][head_dim]` with head_dim fastest.  The plan says "FP16
+ // first" and fp16 is also what makes 32K of context fit: 12 layers x 2 heads x 256 dims x 2 (K and V) x 2 B x
+ // 32768 = 805 MiB, against 1.6 GiB in f32.  The page granule is coarse (the shape's `page_size`) for the
+ // reason `Memory/Qwen-5070-engine-campaign/src/plans/paged-kv-cache.md` L146-170 gives: this engine serves a
+@@ -88,6 +88,7 @@
+ #pragma once
+ 
+ #include "strata/core/geometry.hpp"
++#include "strata/kernels/kv_dtype.hpp"
+ 
+ #include <cstdint>
+ 
+@@ -96,6 +97,7 @@ namespace strata::kernels {
+ /// Geometry of one QSA layer.  The real artifact: n_head 24, n_head_kv 2, head_dim 256, n_rot 64,
+ /// idx_n_head 4, idx_dim 128, idx_block 4, idx_top_k 2048, freq_base 1e7, rms_eps 1e-6.
+ struct QsaShapes {
++    KvStorage storage = KvStorage::Fp16;
+     int64_t n_head = 0;     ///< query heads (24).  n_head must be a multiple of n_head_kv
+     int64_t n_head_kv = 0;  ///< key/value heads (2).  The q -> kv map is `q / (n_head/n_head_kv)`, NOT `q % kv`
+     int64_t head_dim = 0;   ///< 256, and must be a multiple of 4
+@@ -177,13 +179,13 @@ inline uint64_t qsa_step_bytes() { return sizeof(int32_t) * (uint64_t) kStepCoun
+ void qsa_step_fill(int32_t* host_step, int64_t pos, const QsaShapes& s);
+ 
+ 
+-/// One token's K and V into the paged FP16 cache, at logical cell `pos`.
++/// One token's K and V into the paged 16-bit cache (s.storage selects FP16/BF16), at logical cell `pos`.
+ ///
+ ///   k_pool, v_pool  `[page][kv_head][page_size][head_dim]` fp16, page_size*n_pages cells each
+ ///   page_table      (n_pages,) i32: logical page -> physical page.  NOT assumed to be the identity
+ ///   kcur, vcur      (n_head_kv, head_dim) f32.  `kcur` must ALREADY be normed and rotated - V is never rotated
+ ///
+-/// The fp32 -> fp16 conversion is `f16_from_f32` (see f16_bits.hpp) and not `__float2half`.
++/// FP16 uses f16_from_f32; BF16 uses direct FP32 RNE kv_bf16_encode, with no FP16 intermediate.
+ void kv_append(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_table, int64_t pos,
+                const float* kcur, const float* vcur, const QsaShapes& s, void* stream);
+ 
+diff --git a/include/strata/kernels/qsa_decode_attn.hpp b/include/strata/kernels/qsa_decode_attn.hpp
+index e782035..638330f 100644
+--- a/include/strata/kernels/qsa_decode_attn.hpp
++++ b/include/strata/kernels/qsa_decode_attn.hpp
+@@ -21,7 +21,7 @@
+ namespace strata::kernels {
+ 
+ struct QsaAttnPools {
+-    const uint16_t* k_pool = nullptr;   ///< fp16 [page][kv_head][page_size][head_dim], or null when int8
++    const uint16_t* k_pool = nullptr;   ///< storage-tagged 16-bit [page][kv_head][page_size][head_dim], null for quantized KV
+     const uint16_t* v_pool = nullptr;
+     const int8_t* k_q = nullptr;        ///< int8 codes, same layout
+     const int8_t* v_q = nullptr;
+@@ -30,6 +30,7 @@ struct QsaAttnPools {
+     const uint8_t* k_q4 = nullptr;      ///< q4_0 block_q4_0 [page][kv_head][page_size][head_dim / 32 * 18]
+     const uint8_t* v_q4 = nullptr;
+     const int32_t* page_table = nullptr;
++    KvStorage storage = KvStorage::Fp16;
+ };
+ 
+ /// Batch windows: every query's own K/V pools - query z reads p[z] (z < n).  n = 0: the call's one `pools`.
+diff --git a/include/strata/prefill/kernels.hpp b/include/strata/prefill/kernels.hpp
+index 291a576..780064a 100644
+--- a/include/strata/prefill/kernels.hpp
++++ b/include/strata/prefill/kernels.hpp
+@@ -167,7 +167,8 @@ void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t
+ void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const int32_t* page_table, int64_t page_size,
+                uint16_t* k_pool, uint16_t* v_pool, int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale,
+                void* stream, const strata::kernels::KvHostPools* host = nullptr,
+-               const strata::kernels::KvHostPools* stage = nullptr);
++               const strata::kernels::KvHostPools* stage = nullptr,
++               strata::kernels::KvStorage storage = strata::kernels::KvStorage::Fp16);
+ 
+ /// fp32 -> fp16 bits and fp32 -> bf16, n elements (the two activation images of the prompt GEMMs).
+ void to_f16(const float* x, uint16_t* y, int64_t n, void* stream);
+diff --git a/src/core/conversation_file.cpp b/src/core/conversation_file.cpp
+index 24291be..157a813 100644
+--- a/src/core/conversation_file.cpp
++++ b/src/core/conversation_file.cpp
+@@ -787,7 +787,7 @@ bool get_payload(In& in, SavedConversation& s) {
+         int64_t format = 0;
+         if (!in.i64(format) || !in.i64(k.cells) || !in.i64(k.heads) || !in.i64(k.head_dim) ||
+             !in.i64(k.page_size) || !in.i64(k.pooled_rows) || !in.i64(k.idx_dim)) return false;
+-        if (format < INT32_MIN || format > INT32_MAX) return in.fail("invalid K/V format");
++        if (!((format >= 0 && format <= 4) || format == 16 || format == 17)) return in.fail("invalid K/V dtype format");
+         k.format = (int) format;
+         if (!in.buffer(k.k, 0) || !in.buffer(k.v, 1) || !in.buffer(k.k_scale, 2) || !in.buffer(k.v_scale, 3) ||
+             !in.buffer(k.pooled, 4)) return false;
+diff --git a/src/core/conversation_file_test.cpp b/src/core/conversation_file_test.cpp
+index fd85f2c..33ad042 100644
+--- a/src/core/conversation_file_test.cpp
++++ b/src/core/conversation_file_test.cpp
+@@ -373,6 +373,7 @@ int main() {
+         check(differs([](SessionConfig& d) { d.engine_version = "0.1.39"; }), "engine version enters the config");
+         check(differs([](SessionConfig& d) { d.backend = "hip"; }), "backend enters the config");
+         check(differs([](SessionConfig& d) { d.kv = "fp16"; }), "kv enters the config");
++        check(differs([](SessionConfig& d) { d.kv = "bf16"; }), "bf16 enters the config identity");
+         check(differs([](SessionConfig& d) { d.max_context = 65537; }), "max context enters the config");
+         check(differs([](SessionConfig& d) { d.kv_resident = 1; }), "kv residency enters the config");
+         check(differs([](SessionConfig& d) { d.mtp_window = 0; }), "mtp window enters the config");
+diff --git a/src/core/conversation_snapshot.cpp b/src/core/conversation_snapshot.cpp
+index 0e4c440..7b57c18 100644
+--- a/src/core/conversation_snapshot.cpp
++++ b/src/core/conversation_snapshot.cpp
+@@ -33,6 +33,11 @@ bool valid_extent(const QsaState& st, int64_t upto, std::string& error) {
+ 
+ bool layout(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index, Layout& l, std::string& error) {
+     if (!valid_extent(st, upto, error)) return false;
++    if (!strata::kernels::kv_is_16bit(st.storage) ||
++        (st.storage == strata::kernels::KvStorage::Bf16 && (st.kv_int8 || st.kv_q4 || st.kv_hybrid || st.kv_rot)) ||
++        (st.kv_mode && st.storage != st.host.storage)) {
++        error = "conversation snapshot: invalid/mismatched KV dtype"; return false;
++    }
+     if (st.kv_hybrid && (st.kv_mode == 2 || st.kv_q4 || st.kv_int8)) {   // a streamed one reads its host copy
+         error = "conversation snapshot: hybrid K8V4 cannot be a ring and needs distinct format flags";
+         return false;
+@@ -409,6 +414,7 @@ bool refresh_residency(const QsaState& st, const ModelGeometry& g, int64_t upto,
+     if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, nullptr);
+     if (st.kv_mode == 2 && upto > 0) {
+         auto shapes = strata::kernels::qsa_real_shapes();
++        shapes.storage = st.storage;
+         shapes.n_head_kv = g.n_head_kv; shapes.head_dim = g.head_dim;
+         const int64_t end = (upto + shapes.page_size - 1) / shapes.page_size;
+         strata::kernels::kv_ring_restore(qsa_attn_pools(st), st.host, qsa_kv_format(st),
+diff --git a/src/core/conversation_snapshot_test.cpp b/src/core/conversation_snapshot_test.cpp
+index c0eee8a..a14d115 100644
+--- a/src/core/conversation_snapshot_test.cpp
++++ b/src/core/conversation_snapshot_test.cpp
+@@ -64,6 +64,8 @@ struct Fixture {
+     }
+     Fixture(int fmt, int mode) {
+         auto& st = state;
++        st.storage = fmt==kKvBf16 ? KvStorage::Bf16 : KvStorage::Fp16;
++        st.host.storage = st.storage;
+         st.kv_mode = mode; st.kv_int8 = fmt==kKvInt8; st.kv_q4 = fmt==kKvQ4; st.kv_hybrid = fmt==3;
+         st.n_pages = 24; st.n_slots = mode ? 4 : st.n_pages;
+         st.max_cells = st.n_pages * 4; st.idx_pooled_rows = mode==2 ? 2 : st.max_cells/4+2;
+@@ -337,7 +339,7 @@ void full_session(int fmt, int mode, int experts) {
+ int main() {
+     int devices=0;
+     if (cudaGetDeviceCount(&devices)!=cudaSuccess || !devices) return 77;
+-    for (int fmt : std::array<int,4>{kKvF16,kKvInt8,kKvQ4,3}) for (int mode : {0,1,2}) {
++    for (int fmt : std::array<int,5>{kKvF16,kKvInt8,kKvQ4,3,kKvBf16}) for (int mode : {0,1,2}) {
+         if (fmt==3 && mode!=0) continue;
+         Fixture f(fmt,mode);
+         if (fmt==3) {
+@@ -401,7 +403,7 @@ int main() {
+                 check(std::all_of(table.begin(),table.end(),[](int32_t x){return x==-1;}),"stale VRAM pages invalidated");
+             }
+             if (mode==2 && upto>0) {
+-                const auto s=qsa_real_shapes();
++                auto s=qsa_real_shapes(); s.storage=f.state.storage;
+                 const int64_t b1=(upto+s.page_size-1)/s.page_size,b0=std::max<int64_t>(0,b1-f.state.n_slots);
+                 const size_t block=kv_block_bytes(s,fmt)/2;
+                 // Codes and scales are separate in INT8; check code bytes here.
+@@ -415,6 +417,11 @@ int main() {
+                     check(got == expected,"draft ring contains restored pages");
+                 }
+             }
++            if(fmt==kKvBf16 || fmt==kKvF16) {
++                auto wrong=a;wrong.format=fmt==kKvBf16?kKvF16:kKvBf16;
++                check(!conversation_kv_restore(wrong,f.state,f.g,upto,index,err),"FP16/BF16 snapshot cross-dtype rejected");
++                check(a.format==fmt,"snapshot retains exact 16-bit dtype tag");
++            }
+             auto bad=a; bad.head_dim++;
+             check(!conversation_kv_restore(bad,f.state,f.g,upto,index,err),"reject incompatible geometry");
+             if (fmt==kKvInt8) {
+@@ -434,7 +441,7 @@ int main() {
+             }
+         }
+     }
+-    for (int fmt : {kKvF16,kKvInt8,kKvQ4}) for (int mode : {0,1}) for (int experts : {256,512})
++    for (int fmt : {kKvF16,kKvInt8,kKvQ4,kKvBf16}) for (int mode : {0,1}) for (int experts : {256,512})
+         full_session(fmt,mode,experts);
+     for (int experts : {256,512}) full_session(3,0,experts);
+     std::printf("conversation_snapshot_test: %d checks passed\n",checks);
+diff --git a/src/core/dflash2.cpp b/src/core/dflash2.cpp
+index eb96c04..7072200 100644
+--- a/src/core/dflash2.cpp
++++ b/src/core/dflash2.cpp
+@@ -30,7 +30,9 @@ double ms_since(Clock::time_point t) { return std::chrono::duration<double, std:
+ bool mapped(size_t bytes, void** h, void** d) {
+     if (cudaHostAlloc(h, bytes, cudaHostAllocMapped) != cudaSuccess) return false;
+     std::memset(*h, 0, bytes);
+-    return cudaHostGetDevicePointer(d, *h, 0) == cudaSuccess;
++    if (cudaHostGetDevicePointer(d, *h, 0) == cudaSuccess) return true;
++    cudaFreeHost(*h); *h = nullptr; *d = nullptr;
++    return false;
+ }
+ 
+ constexpr int GGML_Q8_0 = 8;
+@@ -59,6 +61,7 @@ Dflash2Drafter::~Dflash2Drafter() {
+     if (h_out_) cudaFreeHost(h_out_);
+     if (cs_) cudaStreamDestroy(cs_);
+     if (cs2_) cudaStreamDestroy(cs2_);
++    for (cudaEvent_t e : ev_hs_) if (e) cudaEventDestroy(e);
+     if (ev_fork_) cudaEventDestroy(ev_fork_);
+     if (ev_join_) cudaEventDestroy(ev_join_);
+     for (cudaEvent_t e : ev_ctx_) if (e) cudaEventDestroy(e);
+@@ -226,7 +229,8 @@ bool Dflash2Drafter::make_streams(std::string& err) {
+         err = "dflash2: stream";
+         return false;
+     }
+-    for (auto& e : ev_hs_) cudaEventCreateWithFlags(&e, cudaEventDisableTiming);
++    for (auto& e : ev_hs_)
++        if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) { err = "dflash2: head events"; return false; }
+     if (cudaEventCreateWithFlags(&ev_fork_, cudaEventDisableTiming) != cudaSuccess || cudaEventCreateWithFlags(&ev_join_, cudaEventDisableTiming) != cudaSuccess) {
+         err = "dflash2: events";
+         return false;
+@@ -243,8 +247,11 @@ bool Dflash2Drafter::make_streams(std::string& err) {
+ }
+ 
+ bool Dflash2Drafter::alloc(std::string& err) {
++    const char* limit_env = std::getenv("STRATA_TEST_DF2_ALLOC_LIMIT_BYTES");
++    const uint64_t limit = limit_env ? std::strtoull(limit_env, nullptr, 10) : UINT64_MAX;
+     auto dev = [&](auto** p, size_t n) {
+         using T = std::remove_pointer_t<std::remove_reference_t<decltype(*p)>>;
++        if (n * sizeof(T) > limit || vram_ > limit - n * sizeof(T)) return false;
+         if (cudaMalloc((void**) p, n * sizeof(T)) != cudaSuccess) return false;
+         vram_ += n * sizeof(T);
+         return true;
+@@ -276,6 +283,11 @@ bool Dflash2Drafter::alloc(std::string& err) {
+     cudaMemset(tag_, 0xff, (size_t) kRing * 8);   // -1: no slot holds a context row yet
+     for (int64_t& t : slot_pos_) t = -1;
+     init_ring_log();
++    const char* log_off = std::getenv("STRATA_DF2_RING_LOG");
++    if (strict_target() && !log_on_ && !(log_off && log_off[0] == '0')) {
++        err = "dflash2: BF16 target requires requested ring-log staging; allocation failed";
++        return false;
++    }
+     cudaMemset(xqp_, 0, (size_t) 5 * N_ * 8 + 4096);
+     cudaMemset(xdp_, 0, ((size_t) 5 * N_ / 32 * 8 + 64) * 4);
+     cudaMemset(xqc_, 0, (size_t) 5 * N_ * 8 + 4096);
+@@ -285,6 +297,9 @@ bool Dflash2Drafter::alloc(std::string& err) {
+ }
+ 
+ bool Dflash2Drafter::bind_raw(EmbedFn embed, const void* head_w, int head_type, int64_t head_rows, const std::vector<int32_t>& vocab, std::string& err) {
++    if (strict_target() && (!embed || !head_w || head_type < 0 || head_rows <= 0)) {
++        err = "dflash2: BF16 target requires a valid embedding and draft head"; return false;
++    }
+     const OnDevice on_device(device_);
+     embed_ = std::move(embed);
+     head_w_ = head_w;
+@@ -583,6 +598,7 @@ bool Dflash2Drafter::capture(int n, const float* taps, std::string& err) {
+ 
+ bool Dflash2Drafter::clone_alloc(const Dflash2Drafter& parent, std::string& err) {
+     if (parent.blob_ == nullptr) { err = "dflash2: the parent drafter has no pack loaded"; return false; }
++    target_storage_ = parent.target_storage_;
+     device_ = parent.device_;
+     const OnDevice on_device(device_);
+     N_ = parent.N_; L_ = parent.L_; NH_ = parent.NH_; NKV_ = parent.NKV_; HD_ = parent.HD_; I_ = parent.I_; window_ = parent.window_;
+@@ -605,6 +621,7 @@ bool Dflash2Drafter::clone_bind(const Dflash2Drafter& parent, std::string& err)
+ }
+ 
+ bool Dflash2Drafter::copy_state_from(Dflash2Drafter& src, std::string& err) {
++    if (src.target_storage_ != target_storage_) { err = "dflash2: target KV dtype mismatch in state copy"; return false; }
+     if (src.device_ != device_ || src.L_ != L_ || src.NKV_ != NKV_) { err = "dflash2: the two drafters are not alike"; return false; }
+     if (!src.context_wait(err) || !context_wait(err)) return false;
+     const OnDevice on_device(device_);
+@@ -620,6 +637,10 @@ bool Dflash2Drafter::copy_state_from(Dflash2Drafter& src, std::string& err) {
+ }
+ 
+ float* Dflash2Drafter::defer_rows(int64_t pos0, int n, std::string& err) {
++    if (pos0 < 0 || n <= 0 || n > kRing2048 || pos0 % kRing2048 + n > kRing2048) {
++        err = "dflash2: deferred rows must be a nonempty contiguous range inside the host ring";
++        return nullptr;
++    }
+     if (dpend_ == nullptr) {
+         const OnDevice on_device(device_);
+         if (cudaHostAlloc((void**) &dpend_, (size_t) kRing2048 * taps_.size() * (size_t) N_ * 4, cudaHostAllocPortable) != cudaSuccess) {
+@@ -751,8 +772,9 @@ void Dflash2Drafter::init_ring_log() {
+     const char* off = std::getenv("STRATA_DF2_RING_LOG");
+     if (off && off[0] == '0') { log_on_ = false; return; }
+     if (const char* e = std::getenv("STRATA_DF2_LOG_MIB"); e && e[0]) stash_budget_ = (uint64_t) std::max(0, std::atoi(e)) << 20;
+-    if (h_logq_ == nullptr && cudaHostAlloc((void**) &h_logq_, (size_t) kRows * N_, cudaHostAllocDefault) != cudaSuccess) h_logq_ = nullptr;
+-    if (h_logd_ == nullptr && cudaHostAlloc((void**) &h_logd_, (size_t) kRows * (N_ / 32) * 4, cudaHostAllocDefault) != cudaSuccess) h_logd_ = nullptr;
++    const bool fail_pin = std::getenv("STRATA_TEST_DF2_PIN_FAILURE") != nullptr;
++    if (!fail_pin && h_logq_ == nullptr && cudaHostAlloc((void**) &h_logq_, (size_t) kRows * N_, cudaHostAllocDefault) != cudaSuccess) h_logq_ = nullptr;
++    if (!fail_pin && h_logd_ == nullptr && cudaHostAlloc((void**) &h_logd_, (size_t) kRows * (N_ / 32) * 4, cudaHostAllocDefault) != cudaSuccess) h_logd_ = nullptr;
+     log_on_ = h_logq_ != nullptr && h_logd_ != nullptr;
+     if (!log_on_) {
+         (void) cudaGetLastError();
+@@ -827,6 +849,10 @@ bool Dflash2Drafter::rebuild(int64_t lo, int64_t hi, int64_t* rebuilt, int64_t*
+     }
+     if (pos.empty()) return true;
+     const OnDevice on_device(device_);
++    if (std::getenv("STRATA_TEST_DF2_REBUILD_FAILURE")) {
++        err = "dflash2: injected rebuild allocation failure";
++        return false;
++    }
+     const size_t rows = pos.size();
+     const size_t cap = (size_t) kRing;   // a window is at most 2048 rows
+     if (rb_q_ == nullptr) {
+@@ -885,7 +911,8 @@ bool Dflash2Drafter::begin_request(const int32_t* ids, int64_t n, int64_t resume
+     last_ms = 0;
+     last_swapped = false;
+     std::string err;
+-    (void) context_wait(err);
++    state_error_.clear();
++    if (!context_wait(err) && strict_target()) { state_error_ = err; return false; }
+     const Clock::time_point t0 = Clock::now();
+     auto lcp_of = [&](const std::vector<int32_t>& h) {
+         int64_t l = 0;
+@@ -935,6 +962,11 @@ bool Dflash2Drafter::begin_request(const int32_t* ids, int64_t n, int64_t resume
+     const int64_t lo = std::max<int64_t>(0, n - (window_ - 1)), hi = resume;
+     if (hi > lo) {
+         if (!rebuild(lo, hi, &rebuilt, &missing, err)) {
++            if (strict_target()) {
++                state_error_ = err;
++                invalidate_ring();
++                return false;
++            }
+             std::fprintf(stderr, "strata dflash2: %s: the ring starts over for this request\n", err.c_str());
+             invalidate_ring();
+             missing = hi - lo;
+diff --git a/src/core/dflash2_ring_test.cpp b/src/core/dflash2_ring_test.cpp
+index d01fa21..8406717 100644
+--- a/src/core/dflash2_ring_test.cpp
++++ b/src/core/dflash2_ring_test.cpp
+@@ -12,9 +12,13 @@
+ //   5 evicted    : a stash too small to keep A: the resume is cold (missing rows reported, *cold set)
+ // Exit 0 when every assertion holds.
+ #include "strata/core/dflash2.hpp"
++#include "strata/core/layer.hpp"
++#include "strata/core/layout.hpp"
++#include "strata/kernels/verify_kernels.hpp"
+ 
+ #include <cuda_runtime.h>
+ 
++#include <algorithm>
+ #include <cmath>
+ #include <cstdint>
+ #include <cstdio>
+@@ -49,7 +53,9 @@ bool feed(Dflash2Drafter& d, float* dev, uint32_t lineage, int64_t from, int64_t
+         const int64_t n = std::min<int64_t>(256, to - p0);
+         for (int64_t r = 0; r < n; ++r)
+             for (int i = 0; i < kTap; ++i) h[(size_t) r * kTap + (size_t) i] = tap_value(lineage, p0 + r, i);
+-        if (cudaMemcpy(dev, h.data(), (size_t) n * kTap * 4, cudaMemcpyHostToDevice) != cudaSuccess) { err = "upload"; return false; }
++        // DFlash2 uses a nonblocking stream. A pageable default-stream cudaMemcpy can return
++        // after staging but before transfer completion; queue the upload with its consumers.
++        if (cudaMemcpyAsync(dev, h.data(), (size_t) n * kTap * 4, cudaMemcpyHostToDevice, d.stream()) != cudaSuccess) { err = "upload"; return false; }
+         if (!d.context(dev, n, p0, err)) return false;
+         std::vector<int32_t> tk((size_t) n);
+         for (int64_t r = 0; r < n; ++r) tk[(size_t) r] = token_of(lineage, p0 + r);
+@@ -96,6 +102,9 @@ int count_bad(Dflash2Drafter& d, const std::vector<float>& ref, int64_t lo, int6
+ int main(int argc, char** argv) {
+     if (argc < 2) { std::printf("usage: dflash2_ring_test PACK [device]\n"); return 2; }
+     const int device = argc > 2 ? std::atoi(argv[2]) : 0;
++    const bool bf16 = argc > 3 && std::strcmp(argv[3], "--bf16") == 0;
++    using strata::kernels::KvStorage;
++    strata::kernels::configured_kv_storage = bf16 ? KvStorage::Bf16 : KvStorage::Fp16;
+     const bool log_off_run = std::getenv("STRATA_DF2_RING_LOG") != nullptr && std::getenv("STRATA_DF2_RING_LOG")[0] == '0';
+     cudaSetDevice(device);
+     std::string err;
+@@ -105,9 +114,77 @@ int main(int argc, char** argv) {
+     std::printf("dflash2_ring_test%s\n", log_off_run ? " (STRATA_DF2_RING_LOG=0)" : "");
+ 
+     auto fresh = [&](Dflash2Drafter& d) -> bool {
++        if (bf16) d.set_target_kv_storage(KvStorage::Bf16);
+         if (!d.load(argv[1], device, err)) { std::printf("load: %s\n", err.c_str()); return false; }
+         return true;
+     };
++    // An actual main/MTP-shaped BF16 allocation is alive while every DFlash2 state operation runs.
++    // A non-FP16-range sentinel catches accidental sharing, conversion or overwriting.
++    strata::core::ModelGeometry main_geometry;
++    strata::core::QsaState main_state;
++    void* main_arena = nullptr;
++    std::vector<uint16_t> sentinel;
++    size_t main_bytes = 0;
++    if (bf16) {
++        setenv("STRATA_KV_HOST_REGISTER", "0", 1); // fixture explicitly owns cudaHostAlloc-backed QSA state
++        strata::core::qsa_set_kv_resident(32768);
++        main_bytes = strata::core::qsa_state_bytes(main_geometry, 128, true, 16);
++        check(cudaMalloc(&main_arena, main_bytes) == cudaSuccess, "main BF16 state allocation");
++        check(strata::core::qsa_state_init(main_geometry, 128, main_arena, main_state, nullptr, 16) > 0, "main BF16 host/resident state");
++        check(main_state.storage == KvStorage::Bf16 && main_state.host.storage == KvStorage::Bf16, "main dtype and host backing are BF16");
++        std::fill(main_state.host.v_pool, main_state.host.v_pool + 128 * 512, uint16_t(0x4800));
++        sentinel.assign(16 * 512, 0x4800); // 131072 in BF16; FP16 would overflow
++        check(cudaMemcpy(main_state.v_pool, sentinel.data(), sentinel.size() * 2, cudaMemcpyHostToDevice) == cudaSuccess && cudaDeviceSynchronize() == cudaSuccess, "main BF16 sentinel upload");
++        std::printf("CONTRACT target=bf16 MTP=bf16 target_sentinel_bits=0x4800 target_sentinel_value=131072 DFlash2 ring=%s\n", Dflash2Drafter::ring_dtype());
++    }
++    // Racecheck instrumentation can exhaust host memory on the long lineage workload.
++    // This bounded case exercises the same context/copy/graph kernels with fewer than 64 rows.
++    if (bf16 && argc > 4 && std::strcmp(argv[4], "--race-smoke") == 0) {
++        std::puts("RACE SMOKE: context/copy/graph/accepted-prefix only; long lineage/rebuild NOT RUN in this mode");
++        Dflash2Drafter d, reference;
++        if (!fresh(d) || !feed(d, dev, 1, 0, 8, err)) return 2;
++        check(reference.clone_alloc(d, err) && reference.copy_state_from(d, err), "smoke independent ring copy");
++        check(!reference.set_target_kv_storage(KvStorage::Fp16), "smoke target dtype cannot be rebound");
++        std::vector<float> before, after;
++        std::vector<int64_t> tb, ta;
++        check(d.debug_ring(before, tb, err) && reference.debug_ring(after, ta, err), "smoke read copy");
++        check(before == after && tb == ta, "smoke copy and zero-acceptance preserve all FP32 ring bits/tags");
++        std::vector<float> taps(8 * kTap);
++        for (int r = 0; r < 8; ++r) for (int i = 0; i < kTap; ++i) taps[r*kTap+i] = tap_value(1, 8+r, i);
++        check(cudaMemcpyAsync(dev, taps.data(), taps.size()*4, cudaMemcpyHostToDevice, d.stream()) == cudaSuccess &&
++              cudaStreamSynchronize(d.stream()) == cudaSuccess, "smoke upload ordered before capture");
++        cudaGraph_t graph = nullptr; cudaGraphExec_t exec = nullptr;
++        check(cudaStreamBeginCapture(d.stream(), cudaStreamCaptureModeGlobal) == cudaSuccess, "smoke graph capture begins");
++        check(d.context_async(dev, 8, 8, err), "smoke capture real context and FP32 ring kernels");
++        check(cudaStreamEndCapture(d.stream(), &graph) == cudaSuccess && graph, "smoke graph capture ends");
++        check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0) == cudaSuccess, "smoke instantiate graph");
++        for (int replay = 0; replay < 2; ++replay)
++            check(cudaGraphLaunch(exec, d.stream()) == cudaSuccess && cudaStreamSynchronize(d.stream()) == cudaSuccess, "smoke graph replay");
++        check(d.context_wait(err), "smoke graph history flush");
++        check(feed(reference, dev, 1, 8, 16, err), "smoke uncaptured context reference");
++        check(d.debug_ring(before, tb, err) && reference.debug_ring(after, ta, err), "smoke read graph comparison");
++        check(before == after && tb == ta, "smoke graph and uncaptured FP32 rings match bitwise");
++        cudaGraphExecDestroy(exec); cudaGraphDestroy(graph);
++        check(feed(d, dev, 3, 16, 19, err), "smoke accept three of eight proposals");
++        for (int pos = 16; pos < 19; ++pos) check(feed(reference, dev, 3, pos, pos+1, err), "smoke independent accepted-row feed");
++        std::vector<float> expected; std::vector<int64_t> te;
++        check(d.debug_ring(after, ta, err) && reference.debug_ring(expected, te, err), "smoke read acceptance");
++        for (int pos = 16; pos < 19; ++pos)
++            check(slot_equal(after, expected, pos) && ta[pos] == te[pos] && !slot_equal(before, after, pos), "smoke accepted prefix changes and matches independent reference");
++        for (int pos = 19; pos < 24; ++pos)
++            check(slot_equal(before, after, pos) && tb[pos] == ta[pos], "smoke rejected suffix retains every layer/head K/V bit and tag");
++        std::vector<uint16_t> main_after(sentinel.size());
++        check(cudaMemcpy(main_after.data(), main_state.v_pool, main_after.size()*2, cudaMemcpyDeviceToHost) == cudaSuccess && main_after == sentinel,
++              "smoke main BF16 device sentinel 0x4800 is unchanged");
++        check(std::all_of(main_state.host.v_pool, main_state.host.v_pool+128*512, [](uint16_t x) { return x == 0x4800; }) &&
++              main_state.storage == KvStorage::Bf16 && strata::kernels::configured_kv_storage == KvStorage::Bf16,
++              "smoke main BF16 host sentinel and dtype are unchanged");
++        check(cudaFreeHost(main_state.host.k_pool) == cudaSuccess && cudaFreeHost(main_state.host_step) == cudaSuccess &&
++              cudaFreeHost(main_state.host_pos) == cudaSuccess && cudaFree(main_arena) == cudaSuccess && cudaFree(dev) == cudaSuccess,
++              "smoke releases test-owned main state and upload buffer");
++        std::puts(g_fail ? "dflash2 race smoke: FAILED" : "dflash2 race smoke: ok (synthetic context only)");
++        return g_fail ? 1 : 0;
++    }
+     std::vector<float> ref;
+     std::vector<int64_t> reftags;
+     {   // ---- 1 rewind
+@@ -119,7 +196,7 @@ int main(int argc, char** argv) {
+         if (!feed(d, dev, 1, P, P + 600, err)) return 2;
+         const std::vector<int32_t> ids = ids_of(1, N);
+         bool cold = false;
+-        d.begin_request(ids.data(), N, P, &cold);
++        check(d.begin_request(ids.data(), N, P, &cold), "request state preparation");
+         int wt = 0;
+         const int bad = count_bad(d, ref, N - 2047, P, &wt);
+         std::printf("    rebuilt %lld rows in %.1f ms, missing %lld, slots wrong %d (wrong tag %d), cold %d\n", (long long) d.last_rebuilt, d.last_ms, (long long) d.last_missing, bad, wt, (int) cold);
+@@ -146,12 +223,12 @@ int main(int argc, char** argv) {
+         {   // B takes over properly: a request for B from scratch
+             const std::vector<int32_t> idsB = ids_of(2, 3000);
+             bool cold = false;
+-            d.begin_request(idsB.data(), 3000, 0, &cold);
++            check(d.begin_request(idsB.data(), 3000, 0, &cold), "request state preparation");
+             if (!feed(d, dev, 2, 0, 3000, err)) return 2;
+         }
+         const std::vector<int32_t> ids = ids_of(1, N);
+         bool cold = true;
+-        d.begin_request(ids.data(), N, P, &cold);
++        check(d.begin_request(ids.data(), N, P, &cold), "request state preparation");
+         int wt = 0;
+         const int bad = count_bad(d, ref, N - 2047, P, &wt);
+         std::printf("    stash hits %lld, rebuilt %lld rows in %.1f ms (swap %d), slots wrong %d (wrong tag %d), stash %.1f MiB\n", (long long) d.ring_stats.stash_hits,
+@@ -171,12 +248,12 @@ int main(int argc, char** argv) {
+             std::vector<int32_t> ids = ids_of(1, P - 300);
+             for (int64_t p = P - 300; p < P - 300 + 400; ++p) ids.push_back(token_of(3, p));
+             bool cold = false;
+-            d.begin_request(ids.data(), (int64_t) ids.size(), P - 300, &cold);
++            check(d.begin_request(ids.data(), (int64_t) ids.size(), P - 300, &cold), "request state preparation");
+             if (!feed(d, dev, 3, P - 300, P - 300 + 400, err)) return 2;   // (rows after the branch point: lineage 3's taps)
+         }
+         const std::vector<int32_t> ids = ids_of(1, N);
+         bool cold = true;
+-        d.begin_request(ids.data(), N, P, &cold);
++        check(d.begin_request(ids.data(), N, P, &cold), "request state preparation");
+         int wt = 0;
+         const int bad = count_bad(d, ref, N - 2047, P, &wt);
+         std::printf("    stash hits %lld, rebuilt %lld rows, missing %lld, slots wrong %d (wrong tag %d)\n", (long long) d.ring_stats.stash_hits, (long long) d.last_rebuilt,
+@@ -194,14 +271,128 @@ int main(int argc, char** argv) {
+         if (!feed(d, dev, 1, 0, P, err)) return 2;
+         const std::vector<int32_t> idsB = ids_of(2, 3000);
+         bool cold = false;
+-        d.begin_request(idsB.data(), 3000, 0, &cold);
++        check(d.begin_request(idsB.data(), 3000, 0, &cold), "request state preparation");
+         if (!feed(d, dev, 2, 0, 3000, err)) return 2;
+         const std::vector<int32_t> ids = ids_of(1, N);
+         cold = false;
+-        d.begin_request(ids.data(), N, P, &cold);
++        check(d.begin_request(ids.data(), N, P, &cold), "request state preparation");
+         std::printf("    stash hits %lld, rebuilt %lld, missing %lld, cold %d\n", (long long) d.ring_stats.stash_hits, (long long) d.last_rebuilt, (long long) d.last_missing, (int) cold);
+         check(cold && d.last_missing > 0 && d.last_rebuilt == 0, "no log of the lineage: cold, the missing rows are reported");
+     }
++    if (bf16) {
++        std::printf("6 mixed drafter copy/deferred/rollback and allocation failures\n");
++        Dflash2Drafter d;
++        if (!fresh(d) || !feed(d, dev, 1, 0, 264, err)) return 2;
++        check(!d.bind_raw({}, nullptr, -1, 0, {}, err), "reject missing embedding/head instead of pretending draft binding succeeded");
++        check(!d.prepare(d.landing(), err) && err.find("not bound") != std::string::npos, "context-only fixture cannot prepare a full drafter graph");
++        check(d.ring_bytes() == 84541440, "five independent FP32 K/V rings: exactly 80.625 MiB");
++        check(d.ring_log_bytes() > 0 && d.ring_log_bytes() < (3ull << 20), "active feature-history allocation counted separately");
++        const uint64_t vram_before_clone = d.vram_bytes();
++        Dflash2Drafter clone;
++        check(clone.clone_alloc(d, err), "clone private ring allocator with shared immutable weights");
++        check(clone.target_kv_storage() == KvStorage::Bf16, "clone preserves target precision contract");
++        check(clone.copy_state_from(d, err), "ring/epoch/feature history state copy");
++        check(d.vram_bytes() == vram_before_clone && clone.vram_bytes() < d.vram_bytes(), "clone does not allocate a second weight blob");
++        std::vector<float> before, after;
++        std::vector<int64_t> tags_before, tags_after;
++        check(d.debug_ring(before, tags_before, err) && clone.debug_ring(after, tags_after, err), "read copied FP32 ring");
++        check(before == after && tags_before == tags_after, "copy is bitwise identical with exact lineage tags");
++        check(!clone.set_target_kv_storage(KvStorage::Fp16) && clone.target_kv_storage() == KvStorage::Bf16, "reject target dtype rebinding after load");
++        { Dflash2Drafter legacy;
++          check(!legacy.set_target_kv_storage(static_cast<KvStorage>(255)), "reject invalid target dtype");
++          check(legacy.load(argv[1], device, err), "load separate default FP16-target drafter");
++          check(!legacy.copy_state_from(d, err) && err.find("dtype mismatch") != std::string::npos, "reject cross-target-dtype state copy before any ring mutation");
++          std::vector<float> rejected_ring; std::vector<int64_t> rejected_tags;
++          check(legacy.debug_ring(rejected_ring, rejected_tags, err), "read rejected-copy destination");
++          check(std::all_of(rejected_ring.begin(), rejected_ring.end(), [](float x) { uint32_t bits; std::memcpy(&bits, &x, 4); return bits == 0; }) &&
++                std::all_of(rejected_tags.begin(), rejected_tags.end(), [](int64_t x) { return x == -1; }), "dtype rejection leaves destination ring bytes/tags empty"); }
++        check(!clone.defer_rows(2047, 2, err) && !clone.defer_rows(-1, 1, err), "reject wrapped/negative deferred host writes before allocation");
++        for (int p = 264; p < 272; ++p) {
++            float* host = clone.defer_rows(p, 1, err);
++            check(host != nullptr, "deferred committed tap allocation");
++            if (!host) return 2;
++            for (int i = 0; i < kTap; ++i) host[i] = tap_value(1, p, i);
++        }
++        check(clone.deferred_bytes() == 104857600, "deferred tap ring is separate 100 MiB pinned host allocation");
++        check(clone.catch_up(268, err) && clone.has_deferred(), "catch-up keeps future committed rows pending");
++        check(clone.catch_up(272, err) && !clone.has_deferred(), "catch-up drains accepted rows only");
++        check(feed(d, dev, 1, 264, 272, err), "uninterrupted eight-row context reference");
++        check(d.debug_ring(before, tags_before, err) && clone.debug_ring(after, tags_after, err), "read deferred/reference rings");
++
++        double max_delta = 0, max_ref = 0;
++        for (size_t i = 0; i < before.size(); ++i) {
++            max_delta = std::max(max_delta, double(std::abs(before[i] - after[i])));
++            max_ref = std::max(max_ref, double(std::abs(before[i])));
++        }
++        std::printf("FP32 context chunk-width 4-vs-8 max_abs_error=%.9g max_reference=%.9g\n", max_delta, max_ref);
++        check(tags_before == tags_after && before == after && max_delta == 0, "different context chunk widths have identical FP32 ring bits/tags");
++        check(feed(d, dev, 1, 264, 268, err) && feed(d, dev, 1, 268, 272, err), "same four-row context chunk sizes as deferred replay");
++        check(d.debug_ring(before, tags_before, err), "read equal chunk-width reference");
++        check(before == after && tags_before == tags_after, "deferred replay exactly matches the same-width uninterrupted FP32 context update");
++        check(clone.copy_state_from(d, err), "align graph comparison boundary bitwise");
++        // Capture the real context-update kernels with the same independent FP32 ring while main KV stays BF16.
++        std::vector<float> graph_taps(8 * kTap);
++        for (int r = 0; r < 8; ++r) for (int i = 0; i < kTap; ++i) graph_taps[r * kTap + i] = tap_value(4, 272 + r, i);
++        check(cudaMemcpyAsync(dev, graph_taps.data(), graph_taps.size() * 4, cudaMemcpyHostToDevice, d.stream()) == cudaSuccess && cudaStreamSynchronize(d.stream()) == cudaSuccess, "graph tap upload");
++        cudaGraph_t graph = nullptr; cudaGraphExec_t exec = nullptr;
++        check(cudaStreamBeginCapture(d.stream(), cudaStreamCaptureModeGlobal) == cudaSuccess, "DFlash2 context graph capture begins");
++        check(d.context_async(dev, 8, 272, err), "capture actual context projection/FP32 ring kernels");
++        check(cudaStreamEndCapture(d.stream(), &graph) == cudaSuccess && graph, "DFlash2 context graph capture ends");
++        check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0) == cudaSuccess, "instantiate context graph");
++        for (int replay = 0; replay < 2; ++replay) {
++            check(cudaGraphLaunch(exec, d.stream()) == cudaSuccess && cudaStreamSynchronize(d.stream()) == cudaSuccess, "DFlash2 graph replay");
++        }
++        check(d.context_wait(err), "flush graph-updated feature history");
++        check(feed(clone, dev, 4, 272, 280, err), "uncaptured context reference");
++        check(d.debug_ring(before, tags_before, err) && clone.debug_ring(after, tags_after, err), "read graph/reference rings");
++        check(before == after && tags_before == tags_after, "captured and uncaptured context ring bytes/tags are identical");
++        cudaGraphExecDestroy(exec); cudaGraphDestroy(graph);
++        // Per acceptance length: ONLY committed taps advance the draft ring; rejected proposal K/V never enters it.
++        Dflash2Drafter accepted_reference;
++        check(accepted_reference.clone_alloc(d, err), "independent accepted-prefix reference allocation");
++        for (int keep = 0; keep <= 8; ++keep) {
++            check(clone.copy_state_from(d, err), "restore mixed-drafter boundary");
++            check(feed(clone, dev, 3, 272, 272 + keep, err), "feed accepted prefix only");
++            check(clone.debug_ring(after, tags_after, err), "inspect accepted/rejected lineage tags");
++            if (keep == 0) check(before == after && tags_before == tags_after, "zero acceptance leaves every ring byte and tag unchanged");
++            check(accepted_reference.copy_state_from(d, err), "independent reference reset");
++            for (int p = 272; p < 272 + keep; ++p)
++                check(feed(accepted_reference, dev, 3, p, p + 1, err), "independent one-row accepted feed");
++            std::vector<float> expected_ring;
++            std::vector<int64_t> expected_tags;
++            check(accepted_reference.debug_ring(expected_ring, expected_tags, err), "read independent accepted reference");
++            for (int p = 272; p < 272 + keep; ++p) {
++                check(slot_equal(after, expected_ring, p) && tags_after[p] == expected_tags[p], "accepted prefix equals independent one-row feed bitwise");
++                check(!slot_equal(before, after, p), "accepted different-lineage taps actually change K/V values");
++            }
++            for (int p = 272 + keep; p < 280; ++p)
++                check(tags_after[p] == tags_before[p] && slot_equal(before, after, p), "rejected suffix preserves every layer/head K/V bit and tag");
++        }
++        // A saved branch exists but a required rebuild allocation fails: strict BF16 mode must not claim a cold success.
++        const auto rewind_ids = ids_of(1, 264);
++        check(feed(d, dev, 1, 272, 2400, err), "overwrite old slots to require rebuild");
++        setenv("STRATA_TEST_DF2_REBUILD_FAILURE", "1", 1);
++        bool cold = false;
++        check(!d.begin_request(rewind_ids.data(), 264, 264, &cold) && !d.state_error().empty(), "rebuild allocation failure is propagated, no cold-ring success");
++        unsetenv("STRATA_TEST_DF2_REBUILD_FAILURE");
++        for (const char* fault : {"STRATA_TEST_DF2_ALLOC_LIMIT_BYTES", "STRATA_TEST_DF2_PIN_FAILURE"}) {
++            setenv(fault, "1", 1);
++            { Dflash2Drafter fail; fail.set_target_kv_storage(KvStorage::Bf16);
++              check(!fail.load(argv[1], device, err), "injected GPU/pinned allocation failure rejects strict draft initialization"); }
++            unsetenv(fault);
++        }
++        std::vector<uint16_t> main_after(sentinel.size());
++        check(cudaMemcpy(main_after.data(), main_state.v_pool, main_after.size() * 2, cudaMemcpyDeviceToHost) == cudaSuccess, "read main BF16 sentinel");
++        check(std::all_of(main_state.host.v_pool, main_state.host.v_pool + 128 * 512, [](uint16_t x) { return x == 0x4800; }), "main BF16 host backing bit pattern is unchanged");
++        check(main_after == sentinel && main_state.storage == KvStorage::Bf16 && strata::kernels::configured_kv_storage == KvStorage::Bf16,
++              "all DFlash2 state/rollback/allocation work leaves main BF16 bits and configuration unchanged");
++        // QsaState follows the upstream process-lifetime convention; the test owns these allocations.
++        check(cudaFreeHost(main_state.host.k_pool) == cudaSuccess, "release test-owned main BF16 host backing");
++        check(cudaFreeHost(main_state.host_step) == cudaSuccess && cudaFreeHost(main_state.host_pos) == cudaSuccess, "release test-owned main staging");
++        cudaFree(main_arena);
++        std::puts("Real draft logits/selector, auto bandit end-to-end and model acceptance: NOT RUN (synthetic context-only fixture)");
++    }
++    cudaFree(dev);
+     std::printf(g_fail == 0 ? "dflash2_ring_test: ok\n" : "dflash2_ring_test: FAILED\n");
+     return g_fail == 0 ? 0 : 1;
+ }
+diff --git a/src/core/expert_source.cpp b/src/core/expert_source.cpp
+index 5decc0e..a0a8b85 100644
+--- a/src/core/expert_source.cpp
++++ b/src/core/expert_source.cpp
+@@ -5011,9 +5011,18 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+         // STRATA_ADAPT_FETCH: the share is the layer's most-routed misses, and the ones the tier would swap in are copied
+         // into a slot as they are fetched (ExpertDispatch::fetch_admit)
+         const bool fetch_on = m > 0 && d.fetch_can(d.layers);
++        // A pinned miss costs one blob transfer however many tokens use it. For a resident
++        // single-GPU pack, spend the same transfer slots on more token rows when requested.
++        static const bool prefer_rows = [] {
++            const char* value = std::getenv("STRATA_PCIE_ROW_PRIORITY");
++            return value != nullptr && std::strcmp(value, "1") == 0;
++        }();
++        const auto* file = prefer_rows ? dynamic_cast<const FileExpertSource*>(d.src) : nullptr;
++        const bool pick_rows = file && file->complement_ready() && !fetch_on && m > 0 && n_tok > 1 &&
++                               native && d.peer == nullptr && d.remote_count == 0 && d.fs == nullptr;
+         const float* use = d.usage.empty() ? nullptr : d.usage.data() + (size_t) d.layers * (size_t) d.n_expert;
+         bool pick[kMaxWindowEntries];
+-        if (fetch_on) {
++        if (fetch_on || pick_rows) {
+             int mq[kMaxWindowEntries], nm = 0;
+             for (int q = 0; q < nd; ++q) {
+                 pick[q] = false;
+@@ -5023,7 +5032,21 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+                     d.src->pinned(d.layers, e))
+                     mq[nm++] = q;
+             }
+-            std::stable_sort(mq, mq + nm, [&](int a, int b) { return use[ids[distinct[a]]] > use[ids[distinct[b]]]; });
++            if (pick_rows) {
++                static const bool announced = [] {
++                    std::fprintf(stderr, "strata: PCIe row priority active for resident expert misses\n");
++                    return true;
++                }();
++                (void) announced;
++                int rows[kMaxWindowEntries] = {};
++                for (int64_t i = 0; i < n; ++i) ++rows[first_of[i]];
++                std::sort(mq, mq + nm, [&](int a, int b) {
++                    const int ra = rows[distinct[a]], rb = rows[distinct[b]];
++                    return ra == rb ? a > b : ra > rb;
++                });
++            } else {
++                std::stable_sort(mq, mq + nm, [&](int a, int b) { return use[ids[distinct[a]]] > use[ids[distinct[b]]]; });
++            }
+             for (int j = 0; j < m && j < nm; ++j) pick[mq[j]] = true;
+         }
+         for (int q = 0; q < nd; ++q) {
+@@ -5050,7 +5073,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+                     kd = 0;                        // Foresight: a landed swap-space slot holds it - a GPU group like a hit
+                 } else {
+                     if (d.fs != nullptr) d.fs->note_miss(d.src, d.layers, e);
+-                    if ((fetch_on ? pick[q] : miss_rank >= nmiss - m) && fetches < P.staging_cap && fetches < 64) {
++                    if (((fetch_on || pick_rows) ? pick[q] : miss_rank >= nmiss - m) && fetches < P.staging_cap && fetches < 64) {
+                         const uint8_t* src = d.src->pinned(d.layers, e) ? d.src->blob(d.layers, e) : nullptr;
+                         if (src != nullptr) {
+                             kd = 1;
+diff --git a/src/core/layer.cpp b/src/core/layer.cpp
+index c6e2831..690a0d1 100644
+--- a/src/core/layer.cpp
++++ b/src/core/layer.cpp
+@@ -600,7 +600,10 @@ uint8_t* kv_host_alloc(uint64_t bytes) {
+     auto register_anon = [](uint64_t n) -> uint8_t* {
+         void* m = mmap(nullptr, (size_t) n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+         if (m == MAP_FAILED) return nullptr;
+-        if (cudaHostRegister(m, (size_t) n, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
++        const unsigned flags = cudaHostRegisterPortable | cudaHostRegisterMapped;
++        const auto status = strata::kernels::configured_kv_storage == strata::kernels::KvStorage::Bf16
++            ? strata::core::pin_register(m, (size_t)n, flags) : cudaHostRegister(m, (size_t)n, flags);
++        if (status != cudaSuccess) {
+             (void) cudaGetLastError();
+             munmap(m, (size_t) n);
+             return nullptr;
+@@ -810,6 +813,11 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
+     const KvPlan p = kv_plan(s, max_cells, ring_cells);
+     const int64_t pages = p.pages;
+     Cursor c{(uint8_t*) base};
++    st.storage = strata::kernels::configured_kv_storage;
++    if (!strata::kernels::kv_is_16bit(st.storage) ||
++        (st.storage == strata::kernels::KvStorage::Bf16 && (g_kv_int8 || g_kv_q4 || g_kv_hybrid || g_kv_elastic))) {
++        std::fprintf(stderr, "KV: conflicting storage formats\n"); return 0;
++    }
+     st.kv_int8 = g_kv_int8 && !g_kv_q4;
+     st.kv_q4 = g_kv_q4;
+     // Hybrid K8V4, main layers only (the drafter's state is created with the globals toggled to INT8 -
+@@ -916,6 +924,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
+     st.host_step[strata::kernels::kStepCount] = 0;
+     // KV streaming: the authoritative K/V of every cell, pinned and device-mapped, in the identity layout
+     st.host = strata::kernels::KvHostPools{};
++    st.host.storage = st.storage;
+     if (p.mode != 0) {
+         const uint64_t hrows = (uint64_t) pages * s.n_head_kv * s.page_size;
+         const uint64_t bytes = (uint64_t) pages * strata::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
+@@ -1012,6 +1021,7 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
+ strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st) {
+     strata::kernels::QsaAttnPools pools;
+     pools.page_table = st.page_table;
++    pools.storage = st.storage;
+     if (st.kv_hybrid) { pools.k_q = st.k_q; pools.k_scale = st.k_scale; pools.v_q4 = st.v_q4; }
+     else if (st.kv_q4) { pools.k_q4 = st.k_q4; pools.v_q4 = st.v_q4; }
+     else if (st.kv_int8) { pools.k_q = st.k_q; pools.v_q = st.v_q; pools.k_scale = st.k_scale; pools.v_scale = st.v_scale; }
+diff --git a/src/core/mtp.cpp b/src/core/mtp.cpp
+index 5403cdc..346a962 100644
+--- a/src/core/mtp.cpp
++++ b/src/core/mtp.cpp
+@@ -391,6 +391,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
+     uint64_t sb = qsa_state_bytes(g, max_cells, false, ring);
+     if (cudaMalloc(&state_arena_, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
+     if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) {
++        if (st_.storage == strata::kernels::KvStorage::Bf16) { err = "mtp: BF16 KV allocation failed; no residency fallback"; return false; }
+         if (st_.kv_mode == 0) { err = "mtp: state init failed"; return false; }
+         std::fprintf(stderr, "strata mtp: no pinned RAM left for the draft layer's K/V copy; keeping it in VRAM\n");
+         cudaGetLastError();
+diff --git a/src/kernels/bf16_bits_cuda.cu b/src/kernels/bf16_bits_cuda.cu
+new file mode 100644
+index 0000000..c5aa734
+--- /dev/null
++++ b/src/kernels/bf16_bits_cuda.cu
+@@ -0,0 +1,33 @@
++#include "strata/kernels/kv_dtype.hpp"
++#include "bf16_reference.hpp"
++#include <cuda_bf16.h>
++#include <cuda_runtime.h>
++#include <cstdio>
++#include <random>
++#include <vector>
++__global__ void encode(const float* x,uint16_t* y,uint16_t* intrinsic,int n){
++    const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=n)return;
++    y[i]=strata::kernels::kv_bf16_encode(x[i]);
++    intrinsic[i]=__bfloat16_as_ushort(__float2bfloat16_rn(x[i]));
++}
++int main(){
++    std::vector<float> x;std::mt19937 gen(5820);
++    auto add=[&](uint32_t u){float f;std::memcpy(&f,&u,4);x.push_back(f);};
++    for(unsigned h=0;h<65536;++h)for(unsigned low:{0u,0x7fffu,0x8000u,0x8001u})add((h<<16)|low);
++    for(int i=0;i<1000000;++i)add(gen());
++    float* dx=nullptr;uint16_t *dy=nullptr,*di=nullptr;
++    if(cudaMalloc(&dx,x.size()*4)!=cudaSuccess||cudaMalloc(&dy,x.size()*2)!=cudaSuccess||cudaMalloc(&di,x.size()*2)!=cudaSuccess)return 1;
++    if(cudaMemcpy(dx,x.data(),x.size()*4,cudaMemcpyHostToDevice)!=cudaSuccess)return 1;
++    encode<<<(x.size()+255)/256,256>>>(dx,dy,di,int(x.size()));
++    if(cudaDeviceSynchronize()!=cudaSuccess)return 1;
++    std::vector<uint16_t> y(x.size()),intr(x.size());
++    if(cudaMemcpy(y.data(),dy,y.size()*2,cudaMemcpyDeviceToHost)!=cudaSuccess||cudaMemcpy(intr.data(),di,intr.size()*2,cudaMemcpyDeviceToHost)!=cudaSuccess)return 1;
++    for(size_t i=0;i<x.size();++i){
++        const auto ref=bf16_test::reference(x[i]);
++        if(!bf16_test::same(y[i],ref)||!bf16_test::same(intr[i],ref)||y[i]!=strata::kernels::kv_bf16_encode(x[i])){
++            std::fprintf(stderr,"FAIL CUDA RNE i=%zu x=%.9g gpu=%04x intrinsic=%04x ref=%04x\n",i,x[i],y[i],intr[i],ref);return 1;
++        }
++    }
++    cudaFree(dx);cudaFree(dy);cudaFree(di);
++    std::printf("PASS CUDA/host bit-exact and independent arithmetic + NVIDIA RNE intrinsic: %zu cases\n",x.size());
++}
+diff --git a/src/kernels/bf16_cpu_test.cpp b/src/kernels/bf16_cpu_test.cpp
+new file mode 100644
+index 0000000..db78019
+--- /dev/null
++++ b/src/kernels/bf16_cpu_test.cpp
+@@ -0,0 +1,27 @@
++#include "strata/kernels/kv_dtype.hpp"
++#include "bf16_reference.hpp"
++#include <cstdio>
++#include <random>
++#include <cstdlib>
++int main() {
++    using namespace strata::kernels;
++    unsigned long count=0;
++    auto check=[&](float f) {
++        const auto got=kv_bf16_encode(f), want=bf16_test::reference(f);
++        if(!bf16_test::same(got,want)) {std::fprintf(stderr,"RNE mismatch %.9g %04x %04x\n",f,got,want);std::exit(1);} ++count;
++    };
++    for(unsigned h=0;h<65536;++h) {
++        check(bf16_test::decode(uint16_t(h)));
++        if((h&0x7fff)<=0x7f80 && kv_bf16_encode(bf16_test::decode(uint16_t(h)))!=h) return 1;
++        for(unsigned low : {0x7fffu,0x8000u,0x8001u}) {
++            uint32_t u=(h<<16)|low; float f;std::memcpy(&f,&u,4);check(f);
++        }
++    }
++    std::mt19937 gen(5820);
++    for(int i=0;i<1000000;++i) {uint32_t u=gen();float f;std::memcpy(&f,&u,4);check(f);}
++    for(float f : {0.f,-0.f,1.f,-1.f,131072.f,1e-8f,1.00390625f,1.01171875f})
++        std::printf("bits input=%.9g cpu=%04x reference=%04x\n",f,kv_bf16_encode(f),bf16_test::reference(f));
++    KvStorage s;
++    if(!parse_kv_storage("bf16",s)||s!=KvStorage::Bf16||parse_kv_storage("BF16",s)||parse_kv_storage("garbage",s)) return 1;
++    std::printf("PASS independent arithmetic RNE: %lu cases, finite encodings exhaustive, tie neighbors exhaustive\n",count);
++}
+diff --git a/src/kernels/bf16_cuda_test.cpp b/src/kernels/bf16_cuda_test.cpp
+new file mode 100644
+index 0000000..8fd5772
+--- /dev/null
++++ b/src/kernels/bf16_cuda_test.cpp
+@@ -0,0 +1,173 @@
++#include "strata/kernels/kv_bf16.hpp"
++#include "strata/kernels/kv_stream.hpp"
++#include "strata/kernels/qsa_prompt_attn.hpp"
++#include "strata/prefill/kernels.hpp"
++#include "bf16_reference.hpp"
++#include <cuda_runtime.h>
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++namespace k=strata::kernels;
++namespace {
++void ck(cudaError_t e) {if(e!=cudaSuccess){std::fprintf(stderr,"CUDA: %s\n",cudaGetErrorString(e));std::exit(1);}}
++void need(bool ok,const char* why){if(!ok){std::fprintf(stderr,"FAIL %s\n",why);std::exit(1);}}
++struct Arena {
++    std::vector<void*> device,host;
++    template<class T> T* alloc(size_t n,bool pinned=false) {
++        T* p=nullptr;
++        if(pinned){ck(cudaHostAlloc(&p,n*sizeof(T),cudaHostAllocMapped));host.push_back(p);std::memset(p,0,n*sizeof(T));}
++        else {ck(cudaMalloc(&p,n*sizeof(T)));device.push_back(p);ck(cudaMemset(p,0,n*sizeof(T)));}
++        return p;
++    }
++    ~Arena(){for(auto p:device)cudaFree(p);for(auto p:host)cudaFreeHost(p);}
++};
++template<class T> std::vector<T> read(const T* p,size_t n){std::vector<T> v(n);ck(cudaMemcpy(v.data(),p,n*sizeof(T),cudaMemcpyDeviceToHost));return v;}
++template<class T> void put(T* d,const std::vector<T>& v){ck(cudaMemcpy(d,v.data(),v.size()*sizeof(T),cudaMemcpyHostToDevice));}
++size_t row(int cell,int h,int page,int physical){return (size_t(physical)*2+h)*page+cell%page;}
++
++void run(int page,int T,int queries=3,int selection_cap=17) {
++    Arena a;auto s=k::qsa_real_shapes();s.storage=k::KvStorage::Bf16;s.page_size=page;
++    const int np=(T+page-1)/page, cells=np*page, nh=int(s.n_head), cap=selection_cap;
++    std::printf("fixture page=%d chunk=%d queries=%d selection_cap=%d\n",page,T,queries,cap);
++    const size_t pool_size=size_t(cells)*512;
++    std::vector<int32_t> table(np);for(int i=0;i<np;++i)table[i]=np-1-i;
++    auto dt=a.alloc<int32_t>(np);put(dt,table);
++    auto pk=a.alloc<uint16_t>(pool_size),pv=a.alloc<uint16_t>(pool_size);
++    auto sk=a.alloc<uint16_t>(pool_size),sv=a.alloc<uint16_t>(pool_size);
++    k::KvHostPools host;host.storage=s.storage;host.k_pool=a.alloc<uint16_t>(pool_size,true);host.v_pool=a.alloc<uint16_t>(pool_size,true);
++    k::KvHostPools stage;stage.storage=s.storage;stage.k_pool=sk;stage.v_pool=sv;
++    std::vector<float> K(size_t(T)*512),V(K.size());
++    for(size_t i=0;i<K.size();++i){K[i]=std::sin(double(i)*0.13)*2.0f;V[i]=std::cos(double(i)*0.07)*0.5f;}
++    // Range sentinels in V prove no FP16 intermediate; zero Q below keeps attention finite.
++    V[0]=1.f;V[1]=131072.f;V[2]=1e-8f;V[3]=1.00390625f;V[4]=1.01171875f;
++    auto dk=a.alloc<float>(K.size()),dv=a.alloc<float>(V.size());put(dk,K);put(dv,V);
++    strata::prefill::kv_append(dk,dv,T,0,dt,page,pk,pv,nullptr,nullptr,nullptr,nullptr,nullptr,&host,&stage,s.storage);
++    ck(cudaDeviceSynchronize());
++    auto gpu_k=read(pk,pool_size),gpu_v=read(pv,pool_size),stage_k=read(sk,pool_size),stage_v=read(sv,pool_size);
++    for(int t=0;t<T;++t)for(int h=0;h<2;++h)for(int d=0;d<256;++d){
++        const size_t src=size_t(t)*512+h*256+d, pi=row(t,h,page,table[t/page])*256+d, hi=row(t,h,page,t/page)*256+d;
++        const auto kb=bf16_test::reference(K[src]),vb=bf16_test::reference(V[src]);
++        need(gpu_k[pi]==kb&&gpu_v[pi]==vb,"prefill raw bits vs arithmetic reference");
++        need(host.k_pool[hi]==kb&&host.v_pool[hi]==vb&&stage_k[hi]==kb&&stage_v[hi]==vb,"mapped host/stage/device bits");
++    }
++    for(int d=0;d<5 && page==1 && T==17;++d)std::printf("device bits input=%.9g gpu=%04x host=%04x reference=%04x\n",V[d],gpu_v[row(0,0,page,table[0])*256+d],host.v_pool[d],bf16_test::reference(V[d]));
++    // Single-token decode writer must match batched prefill exactly, including last partial page.
++    auto ak=a.alloc<uint16_t>(pool_size),av=a.alloc<uint16_t>(pool_size);auto step=a.alloc<int32_t>(4);
++    for(int t=0;t<T;++t){std::vector<int32_t> st={t,t+1,(t+1)/4,std::min(t+1,cap)};put(step,st);
++        k::kv_append_step(ak,av,dt,step,dk+size_t(t)*512,dv+size_t(t)*512,s,nullptr);}
++    need(read(ak,pool_size)==gpu_k&&read(av,pool_size)==gpu_v,"single token vs prefill bit parity");
++    k::QsaAttnPools pools;pools.storage=s.storage;pools.k_pool=pk;pools.v_pool=pv;pools.page_table=dt;
++    const int width=std::min(T,cap),nq=queries;
++    std::vector<int32_t> ids(cap*nq),steps(4*nq);
++    for(int z=0;z<nq;++z){for(int j=0;j<cap;++j)ids[z*cap+j]=j%width;
++        steps[z*4]=nq==T?z:T-1;steps[z*4+1]=steps[z*4]+1;steps[z*4+2]=steps[z*4+1]/4;
++        steps[z*4+3]=nq==T?std::min(z+1,cap):z==0?0:z==1?1:width;}
++    auto di=a.alloc<int32_t>(ids.size()),ds=a.alloc<int32_t>(steps.size());put(di,ids);put(ds,steps);
++    auto gk=a.alloc<uint16_t>(cap*512),gv=a.alloc<uint16_t>(cap*512);
++    k::kv_gather(pk,pv,dt,di,width,s,gk,gv,nullptr);
++    const auto gathered_k=read(gk,width*512),gathered_v=read(gv,width*512);
++    for(int j=0;j<width*512;++j)need(gathered_k[j]==bf16_test::reference(K[j])&&gathered_v[j]==bf16_test::reference(V[j]),"gather preserves bits");
++    std::vector<float> Q(nq*nh*256);for(size_t i=0;i<Q.size();++i)Q[i]=float(std::sin(double(i)*0.17)*1.3);
++    auto q=a.alloc<float>(Q.size()),out=a.alloc<float>(Q.size()),scratch=a.alloc<float>(nq*k::qsa_decode_attn_scratch_floats(cap,s));put(q,Q);
++    k::qsa_decode_attn_batch(q,pools,di,ds,cap,s,scratch,out,nq,nullptr);ck(cudaDeviceSynchronize());auto result=read(out,Q.size());
++    k::kv_bf16_attention_reference(q,pools,di,ds,cap,s,out,nq,nullptr);
++    ck(cudaDeviceSynchronize());const auto scalar=read(out,Q.size());
++    k::kv_bf16_attention(q,pools,di,ds,cap,s,out,nq,nullptr);
++    ck(cudaDeviceSynchronize());const auto warp=read(out,Q.size());
++    need(std::memcmp(warp.data(),scalar.data(),warp.size()*sizeof(float))==0,"warp vs retained CUDA reference raw FP32 bits");
++    std::printf("dispatch/reference bit parity PASS: %zu FP32 outputs\n",result.size());
++    if(cap==2051) {
++        cudaEvent_t start,end;ck(cudaEventCreate(&start));ck(cudaEventCreate(&end));
++        float elapsed[2];
++        for(int mode=0;mode<2;++mode) {
++            ck(cudaEventRecord(start));
++            for(int repeat=0;repeat<10;++repeat) {
++                if(mode==0) k::kv_bf16_attention_reference(q,pools,di,ds,cap,s,out,nq,nullptr);
++                else k::kv_bf16_attention(q,pools,di,ds,cap,s,out,nq,nullptr);
++            }
++            ck(cudaEventRecord(end));ck(cudaEventSynchronize(end));ck(cudaEventElapsedTime(&elapsed[mode],start,end));
++        }
++        std::printf("attention microbench nq=%d width=%d reference_ms=%.6f dispatch_ms=%.6f (10 repeats)\n",nq,cap,elapsed[0]/10,elapsed[1]/10);
++        ck(cudaEventDestroy(start));ck(cudaEventDestroy(end));
++    }
++    std::vector<double> reference_values(Q.size());
++    double max_abs=0,max_ref=0,se=0,sr=0;
++    for(int z=0;z<nq;++z)for(int h=0;h<nh;++h){
++        const int w=steps[z*4+3],kh=h/(nh/2);std::vector<double> scores(w);double m=-INFINITY,sum=0;
++        for(int j=0;j<w;++j){double dot=0;for(int d=0;d<256;++d)dot+=double(Q[(z*nh+h)*256+d])*bf16_test::decode(bf16_test::reference(K[j*512+kh*256+d]));scores[j]=dot/16;m=std::max(m,scores[j]);}
++        for(auto& x:scores){x=std::exp(x-m);sum+=x;}
++        for(int d=0;d<256;++d){double ref=0;for(int j=0;j<w;++j)ref+=scores[j]*bf16_test::decode(bf16_test::reference(V[j*512+kh*256+d]));if(w)ref/=sum;
++            reference_values[(z*nh+h)*256+d]=ref;
++            const double got=result[(z*nh+h)*256+d],err=std::fabs(got-ref);need(std::isfinite(got),"finite attention");
++            need(err<=1e-4+2e-3*std::fabs(ref),"per-element attention error bound");max_abs=std::max(max_abs,err);max_ref=std::max(max_ref,std::fabs(ref));se+=err*err;sr+=ref*ref;
++        }
++    }
++    const double nrms=std::sqrt(se/std::max(sr,1e-30));need(nrms<=1e-3,"attention normalized RMS");
++    // The diagnostic gather-based reader is also dtype-aware; exercise it explicitly.
++    k::qsa_attend(q+size_t(nq-1)*nh*256,gk,gv,width,s,out,nullptr,nullptr);
++    const auto slow=read(out,nh*256);
++    for(size_t i=0;i<slow.size();++i){const double ref=reference_values[size_t(nq-1)*nh*256+i];
++        need(std::isfinite(slow[i])&&std::fabs(double(slow[i])-ref)<=1e-4+2e-3*std::fabs(ref),"gather-based BF16 reader vs independent reference");}
++    auto check_tc=[&](const std::vector<float>& values){
++        double err2=0,ref2=0,ma=0;
++        for(size_t i=0;i<values.size();++i){const double ref=reference_values[i],e=std::fabs(double(values[i])-ref);
++            need(std::isfinite(values[i])&&e<=1e-4+2e-3*std::fabs(ref),"Tensor Core attention vs independent FP64 reference");
++            ma=std::max(ma,e);err2+=e*e;ref2+=ref*ref;}
++        const double rms=std::sqrt(err2/std::max(ref2,1e-30));need(rms<=1e-3,"Tensor Core NRMS");
++        std::printf("TC QK BF16 / softmax PV FP32 page=%d chunk=%d max_abs=%.9g nrms=%.9g\n",page,T,ma,rms);
++    };
++    k::kv_bf16_attention_tc(q,pools,di,ds,cap,s,out,nq,nullptr);ck(cudaDeviceSynchronize());check_tc(read(out,Q.size()));
++    need(k::qsa_prompt_attn_batch(q,pools,di,ds,cap,s,out,nq,nullptr),"BF16 prefill dispatch supported");ck(cudaDeviceSynchronize());check_tc(read(out,Q.size()));
++    if(nq<=k::kAttnRowsMax){
++        k::QsaAttnPoolsRows rows;rows.n=nq;for(int z=0;z<nq;++z)rows.p[z]=pools;
++        k::qsa_decode_attn_batch_rows(q,rows,di,ds,cap,s,scratch,out,nq,nullptr);ck(cudaDeviceSynchronize());need(read(out,Q.size())==result,"verify row dispatch parity");
++    }
++    // Capture append + attention. Replay with changed position and width; host scalars remain fixed.
++    cudaStream_t stream;ck(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));cudaGraph_t graph;cudaGraphExec_t exec;
++    put(step,std::vector<int32_t>{0,T,T/4,1});
++    ck(cudaStreamBeginCapture(stream,cudaStreamCaptureModeGlobal));
++    k::kv_append_step(pk,pv,dt,step,dk,dv,s,stream,&host);
++    k::qsa_decode_attn_step(q,pools,di,step,cap,s,scratch,out,stream);
++    ck(cudaStreamEndCapture(stream,&graph));ck(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0));
++    for(int w:{1,width}) {
++        put(step,std::vector<int32_t>{w-1,T,T/4,w});ck(cudaGraphLaunch(exec,stream));ck(cudaStreamSynchronize(stream));auto replay=read(out,nh*256);
++        k::qsa_decode_attn_step(q,pools,di,step,cap,s,scratch,out,nullptr);ck(cudaDeviceSynchronize());need(read(out,nh*256)==replay,"graph replay attention parity");
++        auto bits=read(pv,pool_size);for(int d=0;d<256;++d)need(bits[row(w-1,0,page,table[(w-1)/page])*256+d]==bf16_test::reference(V[d]),"graph append position advances");
++    }
++    ck(cudaGraphExecDestroy(exec));ck(cudaGraphDestroy(graph));
++    ck(cudaStreamBeginCapture(stream,cudaStreamCaptureModeGlobal));
++    k::kv_bf16_attention_tc(q,pools,di,step,cap,s,out,1,stream);
++    ck(cudaStreamEndCapture(stream,&graph));ck(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0));
++    for(int w:{1,width}){
++        put(step,std::vector<int32_t>{w-1,T,T/4,w});ck(cudaGraphLaunch(exec,stream));ck(cudaStreamSynchronize(stream));auto replay=read(out,nh*256);
++        k::kv_bf16_attention_tc(q,pools,di,step,cap,s,out,1,nullptr);ck(cudaDeviceSynchronize());need(read(out,nh*256)==replay,"Tensor Core graph replay parity");
++    }
++    ck(cudaGraphExecDestroy(exec));ck(cudaGraphDestroy(graph));ck(cudaStreamDestroy(stream));
++    // DMA staging in both directions has the same dtype and retains raw bits.
++    k::QsaAttnPools staging;staging.storage=s.storage;staging.k_pool=sk;staging.v_pool=sv;
++    k::kv_stage_from_host(staging,host,k::kKvBf16,np,s,nullptr);ck(cudaDeviceSynchronize());
++    need(read(sk,pool_size)==std::vector<uint16_t>(host.k_pool,host.k_pool+pool_size),"host to stage bits");
++    k::kv_unstage_to_host(staging,host,k::kKvBf16,0,np,s,nullptr);ck(cudaDeviceSynchronize());
++    need(read(sv,pool_size)==std::vector<uint16_t>(host.v_pool,host.v_pool+pool_size),"stage to host bits");
++    std::printf("PASS page=%d chunk=%d max_abs=%.9g max_ref=%.9g nrms=%.9g append/gather/host/stage/attention/verify-rows/graph\n",page,T,max_abs,max_ref,nrms);
++}
++}
++int main(int argc,char** argv){
++    if(argc>1 && !std::strcmp(argv[1],"--bad-dtype")){
++        Arena a;auto s=k::qsa_real_shapes();s.storage=k::KvStorage::Bf16;k::QsaAttnPools p;
++        // Every buffer/geometry is valid; the one wrong field is the pool's FP16 dtype.
++        p.k_pool=a.alloc<uint16_t>(s.page_size*512);p.v_pool=a.alloc<uint16_t>(s.page_size*512);
++        p.page_table=a.alloc<int32_t>(1);auto ids=a.alloc<int32_t>(1),step=a.alloc<int32_t>(4);
++        put(step,std::vector<int32_t>{0,1,0,1});
++        auto q=a.alloc<float>(s.n_head*256),out=a.alloc<float>(s.n_head*256);
++        k::kv_bf16_attention(q,p,ids,step,1,s,out,1,nullptr);ck(cudaDeviceSynchronize());return 0;
++    }
++    if(argc>1 && !std::strcmp(argv[1],"--bad-stream-format")) {
++        auto s=k::qsa_real_shapes();s.storage=k::KvStorage::Bf16;k::kv_block_bytes(s,99);return 0;
++    }
++    if(argc>1 && !std::strcmp(argv[1],"--prompt-4096")){run(4,4096,4096);return 0;}
++    if(argc>1 && !std::strcmp(argv[1],"--attention-2051")){run(4,2051,3,2051);return 0;}
++    for(int p:{1,4,512})for(int t:{1,17,4096})run(p,t);
++}
+diff --git a/src/kernels/bf16_reference.hpp b/src/kernels/bf16_reference.hpp
+new file mode 100644
+index 0000000..b786aba
+--- /dev/null
++++ b/src/kernels/bf16_reference.hpp
+@@ -0,0 +1,38 @@
++#pragma once
++// Test oracle: arithmetic rounding, independent of the production bit-add encoder.
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++#include <limits>
++namespace bf16_test {
++inline uint16_t reference(float x) {
++    const uint16_t sign=std::signbit(x)?0x8000:0;
++    if(std::isnan(x)) return sign|0x7fc0;
++    if(std::isinf(x)) return sign|0x7f80;
++    double a=std::fabs(double(x));
++    if(a==0) return sign;
++    int e=0; std::frexp(a,&e);
++    // Normal BF16 has eight significant bits; subnormals have fixed 2^-133 spacing.
++    const int power=std::max(e-8,-133);
++    const double scaled=std::ldexp(a,-power), lo=std::floor(scaled), fraction=scaled-lo;
++    const double rounded=lo+(fraction>0.5 || (fraction==0.5 && std::fmod(lo,2.0)!=0));
++    const double value=std::ldexp(rounded,power);
++    if(value>=std::ldexp(1.0,128)) return sign|0x7f80;
++    const float exact=float(value);
++    uint32_t u; std::memcpy(&u,&exact,4);
++    return sign|uint16_t(u>>16);
++}
++inline float decode(uint16_t h) {
++    const int exponent=(h>>7)&255, fraction=h&127;
++    if(exponent==255) return fraction ? std::numeric_limits<float>::quiet_NaN()
++                                      : std::copysign(INFINITY,h&0x8000?-1.f:1.f);
++    const double a=exponent ? std::ldexp(double(128+fraction),exponent-134)
++                            : std::ldexp(double(fraction),-133);
++    return std::copysign(float(a),h&0x8000?-1.f:1.f);
++}
++inline bool same(uint16_t a,uint16_t b) {
++    const bool na=(a&0x7fff)>0x7f80, nb=(b&0x7fff)>0x7f80;
++    return a==b || (na&&nb&&(a&0x40)); // quiet NaN payload may differ
++}
++}
+diff --git a/src/kernels/bf16_state_test.cpp b/src/kernels/bf16_state_test.cpp
+new file mode 100644
+index 0000000..7e08e14
+--- /dev/null
++++ b/src/kernels/bf16_state_test.cpp
+@@ -0,0 +1,80 @@
++// Model-free state tests. These exercise the actual MTP KV primitives and stop bound,
++// not the weight-dependent MtpDrafter/Verifier inference or acceptance probabilities.
++#include "strata/core/layer.hpp"
++#include "strata/core/layout.hpp"
++#include "strata/core/serve_stop_bound.hpp"
++#include "strata/kernels/kv_bf16.hpp"
++#include "strata/kernels/verify_kernels.hpp"
++#include "bf16_reference.hpp"
++#include <cuda_runtime.h>
++#include <cstdio>
++#include <cstdlib>
++#include <vector>
++namespace k=strata::kernels;
++namespace c=strata::core;
++void ck(cudaError_t e){if(e!=cudaSuccess){std::fprintf(stderr,"CUDA: %s\n",cudaGetErrorString(e));std::exit(1);}}
++void need(bool b,const char* s){if(!b){std::fprintf(stderr,"FAIL %s\n",s);std::exit(1);}}
++template<class T>T* alloc(size_t n){T* p=nullptr;ck(cudaMalloc(&p,n*sizeof(T)));return p;}
++int main(int argc,char** argv){
++    setenv("STRATA_KV_HOST_REGISTER", "0", 1);
++    k::configured_kv_storage=k::KvStorage::Bf16;c::qsa_set_kv_resident(32768);
++    c::ModelGeometry g;auto s=c::qsa_shapes(g);c::QsaState st;
++    const bool failure=argc>1;
++    const int cells=failure?2048:128,ring=16;
++    void* arena=alloc<uint8_t>(c::qsa_state_bytes(g,cells,true,ring));
++    const auto used=c::qsa_state_init(g,cells,arena,st,nullptr,ring);
++    auto release_host = [&] {
++        if (st.host.k_pool) ck(cudaFreeHost(st.host.k_pool));
++        if (st.host_step) ck(cudaFreeHost(st.host_step));
++        if (st.host_pos) ck(cudaFreeHost(st.host_pos));
++    };
++    if(failure){
++        need(std::getenv("STRATA_TEST_PIN_BUDGET_MIB")!=nullptr,"explicit fault-injection environment");
++        need(used==0 && st.storage==k::KvStorage::Bf16 && st.kv_mode==2 && !st.host.present(),"pin exhaustion fails closed, preserves requested BF16/ring");
++        release_host();ck(cudaFree(arena));std::puts("PASS injected pinned allocation exhaustion: no dtype or residency fallback");return 0;
++    }
++    need(used>0 && st.storage==k::KvStorage::Bf16 && st.host.storage==st.storage && c::qsa_kv_format(st)==k::kKvBf16,"engine state dtype metadata");
++    c::qsa_state_zero(st,g,nullptr);
++    float *dk=alloc<float>(512),*dv=alloc<float>(512),*q=alloc<float>(24*256),*out=alloc<float>(24*256);
++    auto ids=alloc<int32_t>(8);ck(cudaMemset(q,0,24*256*4));
++    std::vector<float> K(512),V(512);std::vector<uint16_t> expected(cells*512);
++    auto write=[&](int pos,float value){
++        std::fill(K.begin(),K.end(),0.f);std::fill(V.begin(),V.end(),value);
++        ck(cudaMemcpy(dk,K.data(),512*4,cudaMemcpyHostToDevice));ck(cudaMemcpy(dv,V.data(),512*4,cudaMemcpyHostToDevice));
++        int32_t step[4]={pos,pos+1,(pos+1)/4,1};ck(cudaMemcpy(st.step,step,sizeof(step),cudaMemcpyHostToDevice));
++        k::kv_append_step(st.k_pool,st.v_pool,st.page_table,st.step,dk,dv,s,nullptr,&st.host);
++        std::fill(expected.begin()+pos*512,expected.begin()+(pos+1)*512,bf16_test::reference(value));
++    };
++    unsigned scenarios=0;
++    for(int spec:{1,4,k::kVerifyMaxT})for(int accepted=0;accepted<=spec;++accepted)for(int stop:{0,1,2}){
++        // Start just before wrap. Draft writes ahead, then logical commit excludes rejected suffix.
++        for(int t=0;t<60;++t)write(t,float(t)*0.125f);
++        for(int t=0;t<spec;++t)write(60+t,100.f+float(t));
++        std::vector<int> outputs(spec,7);if(spec>1)outputs[1]=99;
++        const int keep=c::serve_stop_bound(accepted,stop==1?1:spec,outputs.data(),[&](int x){return stop==2&&x==99;});
++        need(keep>=0&&keep<=accepted,"bounded commit count");
++        int cursor=60+keep;
++        // Next accepted input overwrites the rejected first row with a distinct BF16 range sentinel.
++        write(cursor,131072.f);++cursor;
++        const int end=(cursor+3)/4;
++        k::kv_ring_restore(c::qsa_attn_pools(st),st.host,k::kKvBf16,std::max(0,end-4),end,4,s,nullptr);
++        std::vector<int32_t> selected(8);for(int j=0;j<8;++j)selected[j]=cursor-8+j;
++        ck(cudaMemcpy(ids,selected.data(),32,cudaMemcpyHostToDevice));
++        int32_t step[4]={cursor-1,cursor,cursor/4,8};ck(cudaMemcpy(st.step,step,16,cudaMemcpyHostToDevice));
++        k::kv_bf16_attention(q,c::qsa_attn_pools(st),ids,st.step,8,s,out,1,nullptr);ck(cudaDeviceSynchronize());
++        std::vector<float> result(24*256);ck(cudaMemcpy(result.data(),out,result.size()*4,cudaMemcpyDeviceToHost));
++        double mean=0;for(int j:selected)mean+=bf16_test::decode(expected[j*512]);mean/=8;
++        for(float v:result)need(std::fabs(v-mean)<=1e-4+2e-3*std::fabs(mean),"accepted history only after ring rollback/reload");
++        // Check ring and backing raw bits, not only the resulting attention.
++        std::vector<uint16_t> ring_bits(16*512);ck(cudaMemcpy(ring_bits.data(),st.v_pool,ring_bits.size()*2,cudaMemcpyDeviceToHost));
++        for(int pos:selected)for(int h=0;h<2;++h)for(int d=0;d<256;++d){
++            const size_t hi=((pos/4)*2+h)*4*256+(pos%4)*256+d;
++            const size_t ri=(((pos/4)%4)*2+h)*4*256+(pos%4)*256+d;
++            need(st.host.v_pool[hi]==expected[pos*512+h*256+d]&&ring_bits[ri]==expected[pos*512+h*256+d],"MTP backing/ring exact bits");
++        }
++        ++scenarios;
++    }
++    release_host();
++    for(void* p:{(void*)dk,(void*)dv,(void*)q,(void*)out,(void*)ids,arena})ck(cudaFree(p));
++    std::printf("PASS %u MTP KV mechanism scenarios: spec 1/4/%d, accept/reject/partial, EOS/output bound, ring wrap/reload; full MTP inference NOT RUN\n",scenarios,k::kVerifyMaxT);
++}
+diff --git a/src/kernels/cpu/native_expert.cpp b/src/kernels/cpu/native_expert.cpp
+index 6c3a101..ad9d393 100644
+--- a/src/kernels/cpu/native_expert.cpp
++++ b/src/kernels/cpu/native_expert.cpp
+@@ -27,6 +27,22 @@
+ #include <vector>
+ 
+ namespace strata::kernels::cpu {
++
++bool nvfp4_use_512() {
++    static const bool enabled = [] {
++        if (std::getenv("STRATA_NO_NVFP4_512") != nullptr) return false;
++#ifdef STRATA_NVFP4_VNNI_NO_VBMI
++        const bool usable = cpu_isa_cap() >= 3 && cpu_avx2_ok() && cpu_avx512bw_ok()
++                         && __builtin_cpu_supports("avx512vnni");
++        if (usable) std::fprintf(stderr, "strata: NVFP4 CPU experts: AVX-512 VNNI (VBMI-free build)\n");
++        return usable;
++#else
++        return cpu_avx512_ok();
++#endif
++    }();
++    return enabled;
++}
++
+ namespace {
+ 
+ const ggml_type_traits_cpu* traits(int type) { return ggml_get_type_traits_cpu((ggml_type) type); }
+@@ -605,8 +621,7 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
+     }
+     // NVFP4 in 512-bit lanes: ggml's arithmetic, blocks decoded once per window; 1.8x at one token, 3.7x at seven
+     // (nvfp4_avx512_parity). STRATA_NO_NVFP4_512 falls back to ggml-cpu.
+-    static const bool nvfp4_512 = cpu_avx512_ok() && std::getenv("STRATA_NO_NVFP4_512") == nullptr;
+-    if (f.gu_type == kNvfp4Type && nvfp4_512 && nvfp4_512_fits(n)) {
++    if (f.gu_type == kNvfp4Type && nvfp4_use_512() && nvfp4_512_fits(n)) {
+         nvfp4_512_gu_rows(blob, f.gu_row, f.up_off, n, act, nt, ff, r0, r1, sg, su);
+         return;
+     }
+@@ -681,8 +696,7 @@ void native_down_rows_impl(const NativeFmt& f, const uint8_t* blob, const void*
+     const int n = (int) f.n_ff;
+     float sd = 1.f;                                   // NVFP4: the expert's s_down (see native_gu_rows)
+     if (f.tail_off) std::memcpy(&sd, blob + f.tail_off + 2 * sizeof(float), sizeof sd);
+-    static const bool nvfp4_512 = cpu_avx512_ok() && std::getenv("STRATA_NO_NVFP4_512") == nullptr;
+-    if (f.d_type == kNvfp4Type && nvfp4_512 && nvfp4_512_fits(n)) {
++    if (f.d_type == kNvfp4Type && nvfp4_use_512() && nvfp4_512_fits(n)) {
+         nvfp4_512_rows(blob + f.down_off, f.d_row, n, hq, nt, out, r0, r1, sd);
+         return;
+     }
+diff --git a/src/kernels/cpu/nvfp4_avx512_parity.cpp b/src/kernels/cpu/nvfp4_avx512_parity.cpp
+index c96490b..a8162d8 100644
+--- a/src/kernels/cpu/nvfp4_avx512_parity.cpp
++++ b/src/kernels/cpu/nvfp4_avx512_parity.cpp
+@@ -299,7 +299,7 @@ int expert_e2e(const char* path, int layer, int e) {
+         float* fp[1] = {ff.data()};
+         float* op[1] = {out.data()};
+         for (int mode = 0; mode < 2; ++mode) {             // 0: s_down folded into up; 1: s_down on the output
+-            const Kern& k = strata::kernels::cpu::cpu_avx512_ok() ? k512 : k256;
++            const Kern& k = strata::kernels::cpu::nvfp4_use_512() ? k512 : k256;
+             k.gu(b.data(), ROW_BYTES, up_off, N, ap, 1, fp, 0, F, sg, mode == 0 ? s_up * s_down : s_up);
+             if (mode == 0) for (float v : ff) hmax_fold = std::fmax(hmax_fold, std::fabs(v));
+             q8->from_float(ff.data(), hq.data(), FF);
+@@ -327,7 +327,7 @@ int main(int argc, char** argv) {
+     ggml_cpu_init();
+     if (argc >= 3 && std::string(argv[1]) == "--expert")
+         return expert_e2e(argv[2], argc >= 4 ? std::atoi(argv[3]) : 0, argc >= 5 ? std::atoi(argv[4]) : 0);
+-    const bool has512 = strata::kernels::cpu::cpu_avx512_ok(), has256 = strata::kernels::cpu::cpu_avx2_ok();
++    const bool has512 = strata::kernels::cpu::nvfp4_use_512(), has256 = strata::kernels::cpu::cpu_avx2_ok();
+     if (argc >= 4 && std::string(argv[1]) == "--bw") {
+         const std::string how = argc >= 5 ? argv[4] : "";
+         return bandwidth(std::atoi(argv[2]), std::atoi(argv[3]), how == "ggml", how == "avx2" || !has512 ? k256 : k512);
+diff --git a/src/kernels/cuda/kv_bf16.cu b/src/kernels/cuda/kv_bf16.cu
+new file mode 100644
+index 0000000..9dc3b04
+--- /dev/null
++++ b/src/kernels/cuda/kv_bf16.cu
+@@ -0,0 +1,201 @@
++#include "strata/kernels/kv_bf16.hpp"
++#include <cuda_runtime.h>
++#include <cuda_bf16.h>
++#include <mma.h>
++#include <cassert>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++namespace strata::kernels {
++namespace {
++void validate(const float* q, const QsaAttnPools& p, const int32_t* ids,
++              const int32_t* steps, int64_t cap, const QsaShapes& s,
++              float* out, int64_t nq) {
++    if(p.storage!=KvStorage::Bf16 || s.storage!=KvStorage::Bf16 || !q || !out ||
++       !ids || !steps || !p.k_pool || !p.v_pool || !p.page_table || p.k_q || p.k_q4 ||
++       p.v_q || p.v_q4 || p.k_scale || p.v_scale || s.head_dim!=256 || s.n_head_kv<=0 || s.n_head<=0 ||
++       s.n_head%s.n_head_kv || s.page_size<=0 || cap<=0 || cap>INT32_MAX || nq<1 || nq>65535) {
++        std::fprintf(stderr,"BF16 KV: invalid dtype/geometry/pools; no FP16 fallback\n");
++        std::exit(2);
++    }
++}
++// One block/query/head, online softmax in FP32. This deliberately favors a small,
++// auditable reference path over throughput. It also handles an empty selection.
++__global__ void bf16_attention_kernel(const float* q, QsaAttnPools p, const int32_t* ids,
++                                     const int32_t* steps, int cap, int nh, int nkh,
++                                     int page_size, float* out) {
++    const int h=blockIdx.x, z=blockIdx.y, d=threadIdx.x, kh=h/(nh/nkh);
++    const int* step=steps+z*kStepCount;
++    const int width=step[kStepWidth];
++    if(width<0 || width>cap) __trap();
++    const float x=q[(size_t(z)*nh+h)*256+d];
++    float m=-INFINITY, l=0.f, a=0.f;
++    __shared__ float reduce[256];
++    for(int j=0;j<width;++j) {
++        const int cell=ids[size_t(z)*cap+j];
++        if(cell<0 || cell>=step[kStepNKv]) __trap();
++        const int page=p.page_table[cell/page_size];
++        if(page<0) __trap(); // resolver must have made every selected page resident
++        const size_t row=(size_t(page)*nkh+kh)*page_size+cell%page_size;
++        reduce[d]=x*kv_bf16_decode(p.k_pool[row*256+d]);
++        __syncthreads();
++        for(int stride=128;stride;stride>>=1) {
++            if(d<stride) reduce[d]+=reduce[d+stride];
++            __syncthreads();
++        }
++        const float score=reduce[0]*(1.f/16.f), next=fmaxf(m,score);
++        const float alpha=expf(m-next), beta=expf(score-next);
++        a=a*alpha+beta*kv_bf16_decode(p.v_pool[row*256+d]);
++        l=l*alpha+beta; m=next;
++        __syncthreads();
++    }
++    out[(size_t(z)*nh+h)*256+d]=l>0 ? a/l : 0.f;
++}
++
++// Same 256-product reduction tree and online softmax order as the reference.
++// Eight dimensions per lane remove block-wide barriers without narrowing Q or
++// changing the BF16 stored K/V. Warp shuffle scheduling follows the existing
++// CUDA QSA path; unlike chunked attention this preserves the reduction grouping.
++__global__ void bf16_attention_warp_kernel(const float* q, QsaAttnPools p, const int32_t* ids,
++                                          const int32_t* steps, int cap, int nh, int nkh,
++                                          int page_size, float* out) {
++    const int h=blockIdx.x, z=blockIdx.y, lane=threadIdx.x, kh=h/(nh/nkh);
++    const int* step=steps+z*kStepCount;
++    const int width=step[kStepWidth];
++    if(width<0 || width>cap) __trap();
++    float x[8],a[8]={0.f},m=-INFINITY,l=0.f;
++    #pragma unroll
++    for(int k=0;k<8;++k) x[k]=q[(size_t(z)*nh+h)*256+lane+32*k];
++    for(int j=0;j<width;++j) {
++        const int cell=ids[size_t(z)*cap+j];
++        if(cell<0 || cell>=step[kStepNKv]) __trap();
++        const int page=p.page_table[cell/page_size];
++        if(page<0) __trap();
++        const size_t row=(size_t(page)*nkh+kh)*page_size+cell%page_size;
++        float v[8];
++        #pragma unroll
++        for(int k=0;k<8;++k) v[k]=__fmul_rn(x[k],kv_bf16_decode(p.k_pool[row*256+lane+32*k]));
++        float sum=__fadd_rn(__fadd_rn(__fadd_rn(v[0],v[4]),__fadd_rn(v[2],v[6])),
++                            __fadd_rn(__fadd_rn(v[1],v[5]),__fadd_rn(v[3],v[7])));
++        #pragma unroll
++        for(int stride=16;stride;stride>>=1) {
++            const float other=__shfl_down_sync(0xffffffff,sum,stride);
++            if(lane<stride) sum=__fadd_rn(sum,other);
++        }
++        const float score=__shfl_sync(0xffffffff,sum,0)*(1.f/16.f),next=fmaxf(m,score);
++        const float alpha=expf(m-next),beta=expf(score-next);
++        #pragma unroll
++        for(int k=0;k<8;++k) a[k]=a[k]*alpha+beta*kv_bf16_decode(p.v_pool[row*256+lane+32*k]);
++        l=l*alpha+beta;m=next;
++    }
++    #pragma unroll
++    for(int k=0;k<8;++k) out[(size_t(z)*nh+h)*256+lane+32*k]=l>0?a[k]/l:0.f;
++}
++
++// A tile shares one KV head across its 12 query heads. Only Q is split into two
++// BF16 components; stored K/V bits are read unchanged. The residual component
++// avoids losing Q's FP32 precision to one BF16 conversion. Softmax and PV remain
++// FP32, so tiny probabilities never pass through BF16/FP16 storage.
++__global__ void bf16_attention_tc_kernel(const float* q, QsaAttnPools p, const int32_t* ids,
++                                        const int32_t* steps, int cap, int nkh, int page_size, float* out) {
++#if __CUDA_ARCH__ >= 800
++    using namespace nvcuda;
++    const int kh=blockIdx.x,z=blockIdx.y,d=threadIdx.x,nh=nkh*12;
++    const int* step=steps+z*kStepCount;
++    const int width=step[kStepWidth];
++    if(width<0 || width>cap) __trap();
++    __shared__ __align__(32) __nv_bfloat16 qhi[256],qlo[256],keys[256];
++    __shared__ __align__(32) float scores[256];
++    __shared__ int cells[16],pages[16];
++    float m[12],l[12],acc[12];
++    for(int h=0;h<12;++h){m[h]=-INFINITY;l[h]=0;acc[h]=0;}
++    for(int j0=0;j0<width;j0+=16){
++        if(d<16){
++            const int cell=j0+d<width?ids[size_t(z)*cap+j0+d]:-1;
++            if(j0+d<width && (cell<0 || cell>=step[kStepNKv])) __trap();
++            cells[d]=cell;pages[d]=cell>=0?p.page_table[cell/page_size]:-1;
++            if(cell>=0 && pages[d]<0) __trap();
++        }
++        __syncthreads();
++        wmma::fragment<wmma::accumulator,16,16,16,float> sums;
++        if(d<32) wmma::fill_fragment(sums,0.f);
++        for(int f=0;f<256;f+=16){
++            const int h=d/16,c=d%16;
++            const float x=h<12?q[(size_t(z)*nh+kh*12+h)*256+f+c]:0.f;
++            const auto hi=kv_bf16_encode(x);
++            qhi[d]=__ushort_as_bfloat16(hi);
++            qlo[d]=__ushort_as_bfloat16(kv_bf16_encode(x-kv_bf16_decode(hi)));
++            const int cell=cells[c],page=pages[c];
++            const size_t row=cell>=0?(size_t(page)*nkh+kh)*page_size+cell%page_size:0;
++            keys[d]=__ushort_as_bfloat16(cell>=0?p.k_pool[row*256+f+h]:uint16_t(0));
++            __syncthreads();
++            if(d<32){
++                wmma::fragment<wmma::matrix_a,16,16,16,__nv_bfloat16,wmma::row_major> ah,al;
++                wmma::fragment<wmma::matrix_b,16,16,16,__nv_bfloat16,wmma::row_major> b;
++                wmma::load_matrix_sync(ah,qhi,16);wmma::load_matrix_sync(al,qlo,16);wmma::load_matrix_sync(b,keys,16);
++                wmma::mma_sync(sums,ah,b,sums);wmma::mma_sync(sums,al,b,sums);
++            }
++            __syncthreads();
++        }
++        if(d<32) wmma::store_matrix_sync(scores,sums,16,wmma::mem_row_major);
++        __syncthreads();
++        for(int j=0;j<16 && j0+j<width;++j){
++            const size_t row=(size_t(pages[j])*nkh+kh)*page_size+cells[j]%page_size;
++            const float v=kv_bf16_decode(p.v_pool[row*256+d]);
++            for(int h=0;h<12;++h){
++                const float score=scores[h*16+j]*(1.f/16.f),next=fmaxf(m[h],score);
++                const float alpha=expf(m[h]-next),beta=expf(score-next);
++                acc[h]=acc[h]*alpha+beta*v;l[h]=l[h]*alpha+beta;m[h]=next;
++            }
++        }
++        __syncthreads();
++    }
++    for(int h=0;h<12;++h)out[(size_t(z)*nh+kh*12+h)*256+d]=l[h]>0?acc[h]/l[h]:0.f;
++#else
++    __trap();
++#endif
++}
++}
++void kv_bf16_attention(const float* q, const QsaAttnPools& p, const int32_t* ids,
++                       const int32_t* steps, int64_t cap, const QsaShapes& s,
++                       float* out, int64_t nq, void* stream) {
++    validate(q,p,ids,steps,cap,s,out,nq);
++    static const bool warp=[]() {
++        const char* v=std::getenv("STRATA_BF16_ATTENTION_WARP");
++        if(!v || !std::strcmp(v,"0")) return false;
++        if(!std::strcmp(v,"1")) {std::fprintf(stderr,"BF16 attention: warp scheduling, FP32 Q/softmax/PV, unchanged BF16 K/V\n");return true;}
++        std::fprintf(stderr,"BF16 attention warp option must be 0 or 1; no fallback\n");std::exit(2);
++    }();
++    if(warp) bf16_attention_warp_kernel<<<dim3((unsigned)s.n_head,(unsigned)nq),32,0,(cudaStream_t)stream>>>(
++        q,p,ids,steps,(int)cap,(int)s.n_head,(int)s.n_head_kv,(int)s.page_size,out);
++    else bf16_attention_kernel<<<dim3((unsigned)s.n_head,(unsigned)nq),256,0,(cudaStream_t)stream>>>(
++        q,p,ids,steps,(int)cap,(int)s.n_head,(int)s.n_head_kv,(int)s.page_size,out);
++    const auto e=cudaGetLastError();
++    if(e!=cudaSuccess){std::fprintf(stderr,"BF16 KV attention: %s\n",cudaGetErrorString(e));std::exit(2);}
++}
++void kv_bf16_attention_reference(const float* q, const QsaAttnPools& p, const int32_t* ids,
++                       const int32_t* steps, int64_t cap, const QsaShapes& s,
++                       float* out, int64_t nq, void* stream) {
++    validate(q,p,ids,steps,cap,s,out,nq);
++    bf16_attention_kernel<<<dim3((unsigned)s.n_head,(unsigned)nq),256,0,(cudaStream_t)stream>>>(
++        q,p,ids,steps,(int)cap,(int)s.n_head,(int)s.n_head_kv,(int)s.page_size,out);
++    const auto e=cudaGetLastError();
++    if(e!=cudaSuccess){std::fprintf(stderr,"BF16 reference: %s\n",cudaGetErrorString(e));std::exit(2);}
++}
++void kv_bf16_attention_tc(const float* q, const QsaAttnPools& p, const int32_t* ids,
++                          const int32_t* steps, int64_t cap, const QsaShapes& s,
++                          float* out, int64_t nq, void* stream) {
++    validate(q,p,ids,steps,cap,s,out,nq);
++    int dev=0,major=0;
++    if(s.n_head!=12*s.n_head_kv || cudaGetDevice(&dev)!=cudaSuccess ||
++       cudaDeviceGetAttribute(&major,cudaDevAttrComputeCapabilityMajor,dev)!=cudaSuccess || major<8){
++        std::fprintf(stderr,"BF16 Tensor Core prefill requires sm_80+ and GQA=12; no fallback\n");std::exit(2);
++    }
++    bf16_attention_tc_kernel<<<dim3((unsigned)s.n_head_kv,(unsigned)nq),256,0,(cudaStream_t)stream>>>(
++        q,p,ids,steps,(int)cap,(int)s.n_head_kv,(int)s.page_size,out);
++    const auto e=cudaGetLastError();
++    if(e!=cudaSuccess){std::fprintf(stderr,"BF16 Tensor Core prefill: %s\n",cudaGetErrorString(e));std::exit(2);}
++}
++}
+diff --git a/src/kernels/cuda/kv_stream.cu b/src/kernels/cuda/kv_stream.cu
+index 209984b..f6f43e5 100644
+--- a/src/kernels/cuda/kv_stream.cu
++++ b/src/kernels/cuda/kv_stream.cu
+@@ -31,6 +31,11 @@ struct Runs {
+ };
+ 
+ Runs runs_of(const QsaAttnPools& slots, const KvHostPools& host, int fmt, const QsaShapes& s) {
++    if (fmt < kKvF16 || fmt > kKvBf16 || !kv_is_16bit(s.storage) ||
++        slots.storage != s.storage || host.storage != s.storage ||
++        ((fmt == kKvBf16) != (s.storage == KvStorage::Bf16))) {
++        std::fprintf(stderr,"kv_stream: invalid/mismatched KV dtype; no fallback\n"); std::exit(2);
++    }
+     const int rows = (int) (s.n_head_kv * s.page_size);
+     Runs r{};
+     if (fmt == kKvHybrid) {   // K8V4: int8 K codes, their scales, rotated q4_0 V
+@@ -197,6 +202,10 @@ __global__ void ring_kernel(int32_t* table, long long n_blocks, long long n_slot
+ }  // namespace
+ 
+ uint64_t kv_block_bytes(const QsaShapes& s, int fmt) {
++    if(fmt < kKvF16 || fmt > kKvBf16 || !kv_is_16bit(s.storage) ||
++       ((fmt == kKvBf16) != (s.storage == KvStorage::Bf16))) {
++        std::fprintf(stderr,"kv_block_bytes: invalid/mismatched dtype\n"); std::exit(2);
++    }
+     const uint64_t rows = (uint64_t) (s.n_head_kv * s.page_size);
+     if (fmt == kKvHybrid)
+         return rows * (uint64_t) s.head_dim + rows * (uint64_t) (s.head_dim / KV_Q8_GROUP) * 2 +
+diff --git a/src/kernels/cuda/native_flash_attn.cu b/src/kernels/cuda/native_flash_attn.cu
+index 5a4f36d..e938724 100644
+--- a/src/kernels/cuda/native_flash_attn.cu
++++ b/src/kernels/cuda/native_flash_attn.cu
+@@ -193,6 +193,7 @@ void native_flash_attn_short_step(const float* q, const uint16_t* k, const uint1
+                                   const int32_t* step, int64_t capacity, int max_context,
+                                   const QsaShapes& shapes, float* output, int32_t* status,
+                                   const uint16_t* mask, void* stream) {
++    if (shapes.storage != KvStorage::Fp16) throw std::invalid_argument("native short attention: BF16 KV unsupported");
+     if (!stream || shapes.n_head != 24 || shapes.n_head_kv != 2 || shapes.head_dim != 256 ||
+         shapes.idx_block != 4 || shapes.idx_top_k < 256 || capacity < 256 ||
+         uint64_t(capacity) > std::numeric_limits<std::size_t>::max() / 1024 ||
+diff --git a/src/kernels/cuda/qsa.cu b/src/kernels/cuda/qsa.cu
+index a635e81..a8ef30e 100644
+--- a/src/kernels/cuda/qsa.cu
++++ b/src/kernels/cuda/qsa.cu
+@@ -88,6 +88,7 @@ void check_sync(const char* what) {
+ /// Geometry validation.  A silently wrong `head_dim % 4` would corrupt the gather's uint2 copy and a silently
+ /// wrong `n_head % n_head_kv` would produce a plausible attention with the wrong key, so both are refused.
+ void validate(const QsaShapes& s, const char* who) {
++    if (!kv_is_16bit(s.storage)) fail("invalid KV storage dtype");
+     if (s.n_head <= 0 || s.n_head_kv <= 0 || s.head_dim <= 0 || s.idx_dim <= 0 || s.idx_n_head <= 0 ||
+         s.idx_block < 2 || s.page_size < 1) {
+         std::fprintf(stderr, "qsa: %s: geometry is not set up\n", who);
+@@ -122,7 +123,7 @@ __device__ __forceinline__ float h2f(uint16_t bits) { return f32_from_f16(bits);
+ __global__ void kv_append_kernel(uint16_t* __restrict__ k_pool, uint16_t* __restrict__ v_pool,
+                                  const int32_t* __restrict__ table, const int32_t* __restrict__ step,
+                                  const float* __restrict__ kcur, const float* __restrict__ vcur, int kv_heads,
+-                                 int head_dim, int page_size, KvHostPools host) {
++                                 int head_dim, int page_size, KvHostPools host, KvStorage storage) {
+     const long long pos = (long long) __ldg(step + kStepPos);
+     const int i = blockIdx.x * blockDim.x + threadIdx.x;
+     if (i >= kv_heads * head_dim) return;
+@@ -132,13 +133,13 @@ __global__ void kv_append_kernel(uint16_t* __restrict__ k_pool, uint16_t* __rest
+     const long long page = (long long) table[pos / page_size];
+     if (page >= 0) {
+         const long long row = (page * kv_heads + h) * page_size + (pos % page_size);
+-        k_pool[row * head_dim + d] = f16_from_f32(kcur[i]);
+-        v_pool[row * head_dim + d] = f16_from_f32(vcur[i]);
++        k_pool[row * head_dim + d] = (storage == KvStorage::Bf16 ? kv_bf16_encode(kcur[i]) : f16_from_f32(kcur[i]));
++        v_pool[row * head_dim + d] = (storage == KvStorage::Bf16 ? kv_bf16_encode(vcur[i]) : f16_from_f32(vcur[i]));
+     }
+     if (host.k_pool != nullptr) {
+         const long long row = ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size);
+-        host.k_pool[row * head_dim + d] = f16_from_f32(kcur[i]);
+-        host.v_pool[row * head_dim + d] = f16_from_f32(vcur[i]);
++        host.k_pool[row * head_dim + d] = (storage == KvStorage::Bf16 ? kv_bf16_encode(kcur[i]) : f16_from_f32(kcur[i]));
++        host.v_pool[row * head_dim + d] = (storage == KvStorage::Bf16 ? kv_bf16_encode(vcur[i]) : f16_from_f32(vcur[i]));
+     }
+ }
+ 
+@@ -439,7 +440,7 @@ __device__ __forceinline__ float warp_sum(float v) {
+ __global__ void qsa_attend_kernel(const float* __restrict__ q, const uint16_t* __restrict__ k_scratch,
+                                   const uint16_t* __restrict__ v_scratch, const int32_t* __restrict__ step,
+                                  int n_head, int n_head_kv, int head_dim,
+-                                 float* __restrict__ attn, float* __restrict__ weights) {
++                                 float* __restrict__ attn, float* __restrict__ weights, KvStorage storage) {
+     const long long n_ids = (long long) __ldg(step + kStepWidth);
+     extern __shared__ float s_w[];       // CAPACITY floats (scores, then weights) + 32 for the reductions
+     float* red = s_w;                    // red[0..31] live past the scores/weights: see the launch
+@@ -462,7 +463,7 @@ __global__ void qsa_attend_kernel(const float* __restrict__ q, const uint16_t* _
+     for (long long j = d; j < n_ids; j += blockDim.x) {
+         const uint16_t* krow = k_scratch + (j * n_head_kv + kv) * head_dim;
+         float acc = 0.0f;
+-        for (int i = 0; i < head_dim; ++i) acc += h2f(krow[i]) * q[(size_t) h * head_dim + i];
++        for (int i = 0; i < head_dim; ++i) acc += (storage == KvStorage::Bf16 ? kv_bf16_decode(krow[i]) : h2f(krow[i])) * q[(size_t) h * head_dim + i];
+         w[j] = acc * scale;
+     }
+     __syncthreads();
+@@ -501,7 +502,7 @@ __global__ void qsa_attend_kernel(const float* __restrict__ q, const uint16_t* _
+ 
+     float acc = 0.0f;
+     for (long long j = 0; j < n_ids; ++j)
+-        acc += (w[j] * inv) * h2f(v_scratch[(j * n_head_kv + kv) * head_dim + d]);
++        acc += (w[j] * inv) * (storage == KvStorage::Bf16 ? kv_bf16_decode(v_scratch[(j * n_head_kv + kv) * head_dim + d]) : h2f(v_scratch[(j * n_head_kv + kv) * head_dim + d]));
+     attn[(size_t) h * head_dim + d] = acc;
+     if (weights != nullptr) {
+         for (long long j = d; j < n_ids; j += blockDim.x) weights[(size_t) h * n_ids + j] = w[j] * inv;
+@@ -595,12 +596,13 @@ const int32_t* step_upload_width(int64_t width, const QsaShapes& s) {
+ void kv_append_step(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_table, const int32_t* step,
+                     const float* kcur, const float* vcur, const QsaShapes& s, void* stream, const KvHostPools* host) {
+     validate(s, "kv_append");
++    if (!kv_is_16bit(s.storage) || (host && host->storage != s.storage)) fail("kv_append: dtype mismatch");
+     if (step == nullptr) fail("kv_append: step is null");
+     // The grid is the head x dim count, which is a CONSTANT - `kv_append` writes one cell.
+     const long long n = s.n_head_kv * s.head_dim;
+     kv_append_kernel<<<grid_for(n, THREADS), THREADS, 0, (cudaStream_t) stream>>>(
+         k_pool, v_pool, page_table, step, kcur, vcur, (int) s.n_head_kv, (int) s.head_dim, (int) s.page_size,
+-        host ? *host : KvHostPools{});
++        host ? *host : KvHostPools{}, s.storage);
+     check_launch("kv_append");
+     if (stream == nullptr) check_sync("kv_append");
+ }
+@@ -689,7 +691,7 @@ void qsa_attend_step(const float* q, const uint16_t* k_scratch, const uint16_t*
+         s_configured = smem;
+     }
+     qsa_attend_kernel<<<(unsigned) s.n_head, (unsigned) s.head_dim, smem, (cudaStream_t) stream>>>(
+-        q, k_scratch, v_scratch, step, (int) s.n_head, (int) s.n_head_kv, (int) s.head_dim, attn, weights);
++        q, k_scratch, v_scratch, step, (int) s.n_head, (int) s.n_head_kv, (int) s.head_dim, attn, weights, s.storage);
+     check_launch("qsa_attend");
+     if (stream == nullptr) check_sync("qsa_attend");
+ }
+diff --git a/src/kernels/cuda/qsa_decode_attn.cu b/src/kernels/cuda/qsa_decode_attn.cu
+index 410ae38..c9fc4cd 100644
+--- a/src/kernels/cuda/qsa_decode_attn.cu
++++ b/src/kernels/cuda/qsa_decode_attn.cu
+@@ -1,3 +1,4 @@
++#include "strata/kernels/kv_bf16.hpp"
+ // src/kernels/cuda/qsa_decode_attn.cu - see include/strata/kernels/qsa_decode_attn.hpp.
+ #include "strata/kernels/qsa_decode_attn.hpp"
+ #include "strata/core/sm75_series.hpp"
+@@ -80,6 +81,11 @@ __device__ __forceinline__ void load8_q4(const QsaAttnPools& p, bool value, long
+ template <int KV_MODE>
+ __device__ __forceinline__ void load8(const QsaAttnPools& p, bool value, long long row, int d0, float* out) {
+     if constexpr (KV_MODE == 0) load8_f16(p, value, row, d0, out);
++    else if constexpr (KV_MODE == 4) {
++        const uint16_t* base = (value ? p.v_pool : p.k_pool) + row * HD + d0;
++#pragma unroll
++        for (int i = 0; i < 8; ++i) out[i] = kv_bf16_decode(base[i]);
++    }
+     else if constexpr (KV_MODE == 1) load8_q8(p, value, row, d0, out);
+     else if constexpr (KV_MODE == 3) {
+         // hybrid K8V4: both sides are defined - K unrotated INT8, V rotated Q4_0 - so a value=true call
+@@ -181,6 +187,9 @@ __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, Qsa
+     __shared__ float sp[G][CHUNK];                // scores, then probabilities
+     __shared__ long long srow[CHUNK];             // pool row of each cell (page, kv head, slot)
+     const int n_ids = __ldg(step + kStepWidth);
++    if constexpr (KV_MODE == 4) {
++        if (n_ids < 0 || n_ids > cap) __trap();
++    }
+     const int chunk = blockIdx.x, kvh = blockIdx.y;
+     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+     const int c0 = chunk * CHUNK;
+@@ -203,7 +212,13 @@ __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, Qsa
+         long long r = -1;
+         if (t < n_here) {
+             const int cell = ids[c0 + t];
++            if constexpr (KV_MODE == 4) {
++                if (cell < 0 || cell >= step[kStepNKv]) __trap();
++            }
+             const long long page = (long long) p.page_table[cell / page_size];
++            if constexpr (KV_MODE == 4) {
++                if (page < 0) __trap();
++            }
+             // a block the KV streaming could not make resident keeps page -1 (ctl[3]); its cells are masked
+             // (score -FLT_MAX, weight 0) instead of being read from before the pool.
+             if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+@@ -307,6 +322,8 @@ __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, Qsa
+         float v;
+         if constexpr (KV_MODE == 0) {
+             v = __half2float(__ushort_as_half(p.v_pool[srow[c] * HD + t]));
++        } else if constexpr (KV_MODE == 4) {
++            v = kv_bf16_decode(p.v_pool[srow[c] * HD + t]);
+         } else if constexpr (KV_MODE == 1) {
+             const float sc = __half2float(__ushort_as_half(p.v_scale[srow[c] * (HD / KV_Q8_GROUP) + t / KV_Q8_GROUP]));
+             v = (float) p.v_q[srow[c] * HD + t] * sc;
+@@ -1079,10 +1096,49 @@ void launch_merge_batch(const int32_t* steps, int64_t cap, const QsaShapes& s, c
+     launch_merge(v2, part_acc, part_m, part_l, n_chunks, steps, attn, stride, (unsigned) s.n_head, (unsigned) n_q, st);
+ }
+ 
++// The MTP draft has one scratch row and submits one query. Verification owns
++// one row per query. Use the same workspace layout as the native FP32 merge.
++void bf16_decode(const float* q, const QsaAttnPools& p, const int32_t* ids,
++                 const int32_t* steps, int64_t cap, const QsaShapes& s, float* scratch,
++                 float* out, int64_t nq, void* stream) {
++    if (cap < CHUNK || cap > INT32_MAX - CHUNK || !scratch || !q || !out || !ids || !steps ||
++        s.head_dim != HD || s.n_head_kv < 1 || s.n_head != G * s.n_head_kv || s.page_size < 1 ||
++        nq < 1 || nq > 65535 || s.storage != KvStorage::Bf16 || p.storage != KvStorage::Bf16 ||
++        !p.page_table || !p.k_pool || !p.v_pool || p.k_q || p.v_q || p.k_q4 || p.v_q4 ||
++        p.k_scale || p.v_scale) {
++        kv_bf16_attention(q, p, ids, steps, cap, s, out, nq, stream);
++        return;
++    }
++    static const bool logged = [] {
++        std::fprintf(stderr, "BF16 attention: parallel 64-cell chunks, FP32 Q/softmax/PV\n");
++        return true;
++    }();
++    (void)logged;
++    const int chunks = (cap + CHUNK - 1) / CHUNK;
++    const size_t parts = (size_t)chunks * s.n_head;
++    float* maxima = scratch + parts * HD;
++    float* sums = maxima + parts;
++    auto st = static_cast<cudaStream_t>(stream);
++    attn_chunk_kernel<4><<<dim3(chunks, s.n_head_kv, nq), THREADS, 0, st>>>(
++        q, p, ids, steps, s.n_head_kv, s.page_size, 1.f / 16.f, scratch, maxima, sums,
++        chunks, cap, qsa_decode_attn_scratch_floats(cap, s));
++    launch_merge_batch(steps, cap, s, scratch, out, nq, 1, st);
++    const auto error = cudaGetLastError();
++    if (error != cudaSuccess) {
++        std::fprintf(stderr, "BF16 chunk attention: %s\n", cudaGetErrorString(error));
++        std::exit(2);
++    }
++}
++
+ }  // namespace
+ 
+ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
+                            int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {
++    if (s.storage == KvStorage::Bf16 || pools.storage == KvStorage::Bf16) {
++        bf16_decode(q, pools, ids, steps, cap, s, scratch, attn, n_q, stream); return;
++    }
++    if (s.storage != KvStorage::Fp16 || pools.storage != KvStorage::Fp16) std::exit(2);
++
+     if (n_q <= 0) return;
+     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch || !ids || !steps ||
+         !pools.page_table || n_q > 65535) {
+@@ -1101,6 +1157,9 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
+ 
+ bool qsa_decode_attn_slots(const float* q, const QsaAttnSlotPools& pools, const int32_t* ids, const int32_t* steps,
+                            int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {
++    if (s.storage != KvStorage::Fp16) { std::fprintf(stderr,"BF16 KV: slot batching unsupported\n"); std::exit(2); }
++    for (int64_t i=0; i<n_q && i<kQsaAttnMaxSlots; ++i) if(pools.p[i].storage != KvStorage::Fp16) std::exit(2);
++
+     if (n_q <= 0) return true;
+     if (n_q > kQsaAttnMaxSlots) return false;
+     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch || !ids || !steps) {
+@@ -1159,6 +1218,18 @@ bool qsa_decode_attn_slots(const float* q, const QsaAttnSlotPools& pools, const
+ 
+ void qsa_decode_attn_batch_rows(const float* q, const QsaAttnPoolsRows& rows, const int32_t* ids, const int32_t* steps,
+                                 int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {
++    if (n_q < 0 || n_q > kAttnRowsMax || rows.n != n_q) std::exit(2);
++    bool bf = s.storage == KvStorage::Bf16;
++    for (int64_t r=0; r<n_q; ++r) bf = bf || rows.p[r].storage == KvStorage::Bf16;
++    if (bf) {
++        for (int64_t r=0; r<n_q; ++r)
++            bf16_decode(q+r*s.n_head*s.head_dim, rows.p[r], ids+r*cap,
++                              steps+r*kStepCount,cap,s,scratch,attn+r*s.n_head*s.head_dim,1,stream);
++        return;
++    }
++    if(s.storage != KvStorage::Fp16) std::exit(2);
++    for(int64_t r=0; r<n_q; ++r) if(rows.p[r].storage != KvStorage::Fp16) std::exit(2);
++
+     if (n_q <= 0) return;
+     const QsaAttnPools& pools = rows.p[0];
+     if (rows.n != n_q || n_q > kAttnRowsMax || s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 ||
+@@ -1216,6 +1287,11 @@ uint64_t qsa_decode_attn_scratch_floats(int64_t cap, const QsaShapes& s) {
+ 
+ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* step,
+                           int64_t cap, const QsaShapes& s, float* scratch, float* attn, void* stream) {
++    if (s.storage == KvStorage::Bf16 || pools.storage == KvStorage::Bf16) {
++        bf16_decode(q, pools, ids, step, cap, s, scratch, attn, 1, stream); return;
++    }
++    if (s.storage != KvStorage::Fp16 || pools.storage != KvStorage::Fp16) std::exit(2);
++
+     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch || !ids || !step ||
+         !pools.page_table) {
+         std::fprintf(stderr, "qsa_decode_attn: unsupported geometry or missing buffers\n");
+@@ -1268,6 +1344,8 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
+ void qsa_decode_attn_chunks_only(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
+                                  int64_t cap, const QsaShapes& s, float* scratch, int64_t n_q, int daily_chunk,
+                                  void* stream) {
++    if (s.storage != KvStorage::Fp16 || pools.storage != KvStorage::Fp16) { std::fprintf(stderr,"BF16 KV: split chunks unsupported\n"); std::exit(2); }
++
+     if (n_q <= 0 || n_q > 65535 || s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch ||
+         !q || !ids || !steps || !pools.page_table || (daily_chunk != 0 && daily_chunk != 1)) {
+         std::fprintf(stderr, "qsa_decode_attn_chunks_only: unsupported geometry or missing buffers\n");
+@@ -1283,6 +1361,8 @@ void qsa_decode_attn_chunks_only(const float* q, const QsaAttnPools& pools, cons
+ 
+ void qsa_decode_attn_merge_only(const int32_t* steps, int64_t cap, const QsaShapes& s, const float* scratch,
+                                 float* attn, int64_t n_q, int v2, void* stream) {
++    if (s.storage != KvStorage::Fp16) std::exit(2);
++
+     if (n_q <= 0 || n_q > 65535 || s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch ||
+         (v2 != 0 && v2 != 1) || !steps || !attn) {
+         std::fprintf(stderr, "qsa_decode_attn_merge_only: unsupported geometry or missing buffers\n");
+diff --git a/src/kernels/cuda/qsa_prompt_attn.cu b/src/kernels/cuda/qsa_prompt_attn.cu
+index 1b9e701..d94dda7 100644
+--- a/src/kernels/cuda/qsa_prompt_attn.cu
++++ b/src/kernels/cuda/qsa_prompt_attn.cu
+@@ -1,3 +1,4 @@
++#include "strata/kernels/kv_bf16.hpp"
+ // src/kernels/cuda/qsa_prompt_attn.cu - see include/strata/kernels/qsa_prompt_attn.hpp.
+ #include "strata/core/emulate.hpp"
+ #include "strata/core/sm120_series.hpp"
+@@ -2470,6 +2471,17 @@ bool qsa_prompt_attn_batch_gated(const float* q, const QsaAttnPools& pools, cons
+ 
+ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
+                            int64_t cap, const QsaShapes& s, float* attn, int64_t n_q, void* stream) {
++    if (s.storage == KvStorage::Bf16 || pools.storage == KvStorage::Bf16) {
++#if !defined(__HIPCC__)
++        static const bool tc=[] {const char* e=std::getenv("STRATA_BF16_PREFILL_TC");return e && !std::strcmp(e,"1");}();
++        if(tc) kv_bf16_attention_tc(q,pools,ids,steps,cap,s,attn,n_q,stream);
++        else
++#endif
++        kv_bf16_attention(q,pools,ids,steps,cap,s,attn,n_q,stream);
++        return true;
++    }
++    if(s.storage != KvStorage::Fp16 || pools.storage != KvStorage::Fp16) std::exit(2);
++
+     if (n_q <= 0) return true;
+     bool volta = false, turing = false, t75 = false;   // per call, from the CURRENT device (a layer split can mix Turing with newer cards)
+     {   // sm_75 or newer: the MMA above compiles for both.  sm_80+ runs the cp.async kernel (launch_i8); Turing has
+diff --git a/src/kernels/kv_stream_parity.cpp b/src/kernels/kv_stream_parity.cpp
+index 722b7bc..04ba3d0 100644
+--- a/src/kernels/kv_stream_parity.cpp
++++ b/src/kernels/kv_stream_parity.cpp
+@@ -51,6 +51,7 @@ template <typename T> T* halloc(size_t n) {   // pinned, mapped; returns the dev
+ struct Pools {   // one K/V pool set of `pages` pages
+     k::KvHostPools p;   // reused as a plain pointer bundle
+     void alloc(int64_t pages, const k::QsaShapes& s, int fmt, bool host) {
++        p.storage = s.storage;
+         const size_t rows = (size_t) pages * s.n_head_kv * s.page_size;
+         if (fmt == k::kKvHybrid) {
+             const size_t b = rows * k::kv_q4_bytes_per_head((int) s.head_dim);
+@@ -73,6 +74,7 @@ struct Pools {   // one K/V pool set of `pages` pages
+     }
+     k::QsaAttnPools attn(const int32_t* table) const {
+         k::QsaAttnPools a;
++        a.storage = p.storage;
+         a.k_pool = p.k_pool; a.v_pool = p.v_pool; a.k_q = p.k_q; a.v_q = p.v_q; a.k_scale = p.k_scale;
+         a.v_scale = p.v_scale; a.k_q4 = p.k_q4; a.v_q4 = p.v_q4; a.page_table = table;
+         return a;
+@@ -114,10 +116,11 @@ std::vector<int32_t> selection(int64_t n_kv, int64_t width, std::mt19937& rng) {
+     return ids;
+ }
+ 
+-bool run(int fmt) {
+-    const char* name = fmt == k::kKvHybrid ? "k8v4" : fmt == k::kKvQ4 ? "q4_0" : fmt == k::kKvInt8 ? "int8" : "fp16";
++bool run(int fmt, int64_t N = 40000) {
++    const char* name = fmt == k::kKvBf16 ? "bf16" : fmt == k::kKvHybrid ? "k8v4" : fmt == k::kKvQ4 ? "q4_0" : fmt == k::kKvInt8 ? "int8" : "fp16";
+     k::QsaShapes s = k::qsa_real_shapes();
+-    const int64_t N = 40000, n_blocks = (N + 3) / 4, n_slots = 8 * 516 + 700;   // must evict: slots < blocks
++    s.storage = fmt == k::kKvBf16 ? k::KvStorage::Bf16 : k::KvStorage::Fp16;
++    const int64_t n_blocks = (N + 3) / 4, n_slots = fmt == k::kKvBf16 ? 8192 : 8 * 516 + 700;   // must evict: slots < blocks
+     const int64_t cap = k::qsa_selection_width(k::kTopkMaxCells, s), NQ = 8;
+     const int64_t H = s.n_head_kv, D = s.head_dim, NH = s.n_head;
+     std::mt19937 rng(7 + 4 * fmt);
+@@ -211,6 +214,40 @@ bool run(int fmt) {
+                 c.lookups ? 100.0 * (double) (c.lookups - c.misses) / (double) c.lookups : 0.0, (int) c.overflow, bad);
+     if (c.overflow || c.calls != (uint64_t) batches || c.misses == 0 || c.misses >= c.lookups) ++bad;
+ 
++    if(fmt == k::kKvBf16) {
++        const size_t per_block=size_t(s.page_size*s.n_head_kv*s.head_dim);
++        std::vector<uint16_t> bits_k(size_t(n_slots)*per_block),bits_v(bits_k.size());
++        ck(cudaMemcpy(bits_k.data(),slots.p.k_pool,bits_k.size()*2,cudaMemcpyDeviceToHost),"resident K bits");
++        ck(cudaMemcpy(bits_v.data(),slots.p.v_pool,bits_v.size()*2,cudaMemcpyDeviceToHost),"resident V bits");
++        for(int64_t block=0;block<n_blocks;++block) if(pt[block]>=0) {
++            const size_t gpu=size_t(pt[block])*per_block,backing=size_t(block)*per_block;
++            if(std::memcmp(bits_k.data()+gpu,host.p.k_pool+backing,per_block*2) ||
++               std::memcmp(bits_v.data()+gpu,host.p.v_pool+backing,per_block*2)) ++bad;
++        }
++        cudaStream_t cs;cudaGraph_t graph;cudaGraphExec_t exec;
++        ck(cudaStreamCreateWithFlags(&cs,cudaStreamNonBlocking),"stream");
++        ck(cudaStreamBeginCapture(cs,cudaStreamCaptureModeGlobal),"begin capture");
++        k::kv_stream_resolve(m,slots.attn(m.page_table),host.p,fmt,ids,steps,1,cap,s,cs);
++        k::qsa_decode_attn_batch(q,slots.attn(m.page_table),ids,steps,cap,s,scratch,out_str,1,cs);
++        ck(cudaStreamEndCapture(cs,&graph),"end capture");ck(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0),"instantiate");
++        for(int64_t end : {N,cap,N}) {
++            std::vector<int32_t> selected(cap);for(int64_t j=0;j<cap;++j)selected[j]=int32_t(end-cap+j);
++            int32_t st[4]={int32_t(end-1),int32_t(end),int32_t(end/4),int32_t(cap)};
++            ck(cudaMemcpy(ids,selected.data(),cap*4,cudaMemcpyHostToDevice),"graph ids");
++            ck(cudaMemcpy(steps,st,16,cudaMemcpyHostToDevice),"graph step");
++            k::kv_stream_reset(m,nullptr);ck(cudaDeviceSynchronize(),"invalidate slots");
++            ck(cudaGraphLaunch(exec,cs),"stream graph");ck(cudaStreamSynchronize(cs),"replay sync");
++            k::qsa_decode_attn_batch(q,ref.attn(ident),ids,steps,cap,s,scratch,out_ref,1,nullptr);
++            ck(cudaMemcpy(a.data(),out_ref,NH*D*4,cudaMemcpyDeviceToHost),"graph ref");
++            ck(cudaMemcpy(b2.data(),out_str,NH*D*4,cudaMemcpyDeviceToHost),"graph out");
++            if(std::memcmp(a.data(),b2.data(),NH*D*4)) ++bad;
++            if(k::kv_stream_counters(m).overflow) ++bad;
++        }
++        ck(cudaGraphExecDestroy(exec),"destroy exec");ck(cudaGraphDestroy(graph),"destroy graph");ck(cudaStreamDestroy(cs),"destroy stream");
++        std::printf("  bf16 raw host/resident bits + streaming graph reset/reload: logical=%lld resident=%lld failures=%d\n",
++                    (long long)N,(long long)(n_slots*s.page_size),bad);
++    }
++
+     // 4. a ring over the same host copy: blocks [b1 - R, b1) restored, read through `b % R`
+     {
+         const int64_t R = 1500, b1 = n_blocks, b0 = b1 - R;
+@@ -237,7 +274,9 @@ bool run(int fmt) {
+ }
+ }  // namespace
+ 
+-int main() {
++int main(int argc, char** argv) {
++    if(argc==2 && !std::strcmp(argv[1],"--bf16-long")) return run(k::kKvBf16,262144) ? 0 : 1;
++    if(argc==2 && !std::strcmp(argv[1],"--bf16")) return run(k::kKvBf16) ? 0 : 1;
+     std::printf("kv_stream_parity: streamed vs resident KV, bitwise\n");
+     const bool a = run(k::kKvInt8), b = run(k::kKvF16), c = run(k::kKvQ4), d = run(k::kKvHybrid);
+     if (!a || !b || !c || !d) ++g_fail;
+diff --git a/src/prefill/kernels.cu b/src/prefill/kernels.cu
+index e5a4760..3e6ece5 100644
+--- a/src/prefill/kernels.cu
++++ b/src/prefill/kernels.cu
+@@ -2532,7 +2532,7 @@ __global__ void gate_attn_kernel(const float* __restrict__ a, const float* __res
+ __global__ void kv_append_kernel(const float* __restrict__ K, const float* __restrict__ V, int64_t pos0,
+                                  const int32_t* __restrict__ table, int64_t page_size, uint16_t* k_pool,
+                                  uint16_t* v_pool, int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale,
+-                                 strata::kernels::KvHostPools host, strata::kernels::KvHostPools stage) {
++                                 strata::kernels::KvHostPools host, strata::kernels::KvHostPools stage, strata::kernels::KvStorage storage) {
+     const int64_t t = blockIdx.x;
+     const int kvh = blockIdx.y, g = blockIdx.z >> 1;
+     const bool is_v = (blockIdx.z & 1) != 0;
+@@ -2543,7 +2543,7 @@ __global__ void kv_append_kernel(const float* __restrict__ K, const float* __res
+     const int64_t row = (page * 2 + kvh) * page_size + pos % page_size;
+     const int64_t row_id = ((pos / page_size) * 2 + kvh) * page_size + pos % page_size;
+     if (k_pool != nullptr) {
+-        const uint16_t h = hf(x);
++        const uint16_t h = storage == strata::kernels::KvStorage::Bf16 ? strata::kernels::kv_bf16_encode(x) : hf(x);
+         if (page >= 0) (is_v ? v_pool : k_pool)[row * 256 + d] = h;
+         if (host.k_pool != nullptr) (is_v ? host.v_pool : host.k_pool)[row_id * 256 + d] = h;
+         if (stage.k_pool != nullptr) (is_v ? stage.v_pool : stage.k_pool)[row_id * 256 + d] = h;
+@@ -2800,11 +2800,18 @@ __global__ void __launch_bounds__(256, 2) gr_upmix_cuda_kernel(const uint16_t* _
+ 
+ void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const int32_t* page_table, int64_t page_size,
+                uint16_t* k_pool, uint16_t* v_pool, int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale,
+-               void* stream, const strata::kernels::KvHostPools* host, const strata::kernels::KvHostPools* stage) {
++               void* stream, const strata::kernels::KvHostPools* host, const strata::kernels::KvHostPools* stage,
++               strata::kernels::KvStorage storage) {
++    if (!strata::kernels::kv_is_16bit(storage) ||
++        (host && host->present() && host->storage != storage) ||
++        (stage && stage->present() && stage->storage != storage) ||
++        (storage == strata::kernels::KvStorage::Bf16 && (k_q || v_q || k_scale || v_scale))) {
++        std::fprintf(stderr,"prefill append: invalid KV dtype; no fallback\n"); std::exit(2);
++    }
+     if (T <= 0) return;
+     kv_append_kernel<<<dim3((unsigned) T, 2, 8), 64, 0, (cudaStream_t) stream>>>(
+         K, V, pos0, page_table, page_size, k_pool, v_pool, k_q, v_q, k_scale, v_scale,
+-        host ? *host : strata::kernels::KvHostPools{}, stage ? *stage : strata::kernels::KvHostPools{});
++        host ? *host : strata::kernels::KvHostPools{}, stage ? *stage : strata::kernels::KvHostPools{}, storage);
+     check("kv_append");
+ }
+ void set_act_f16(bool on) {
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index e3f3ded..13f7dd5 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -1320,6 +1320,7 @@ bool stage_own() { static const bool v = std::getenv("STRATA_KV_STAGE_OWN") != n
+ void take_stage(Alloc& o_borrowed, const core::SessionState& ss, const strata::kernels::QsaShapes& s,
+                 strata::kernels::KvHostPools& st, bool& ok) {
+     const core::QsaState& q0 = ss.qsa_states[ss.qsa_primary()];
++    st.storage = q0.storage;
+     if (q0.kv_mode != 1) return;
+     if (stage_own() && o_borrowed.count_only) return;
+     Alloc own;
+@@ -1348,6 +1349,7 @@ strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, co
+     p.k_pool = h.k_pool; p.v_pool = h.v_pool; p.k_q = h.k_q; p.v_q = h.v_q; p.k_scale = h.k_scale; p.v_scale = h.v_scale;
+     p.k_q4 = h.k_q4; p.v_q4 = h.v_q4;
+     p.page_table = table;
++    p.storage = h.storage;
+     return p;
+ }
+ }  // namespace
+@@ -2424,7 +2426,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
+             strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, c0, nb, Kc, Vc, s, m.cs, &st.host);
+         } else {
+             kv_append(Kc, Vc, nb, c0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
+-                      st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs, &st.host);
++                      st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs, &st.host, nullptr, st.storage);
+         }
+     }
+     if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
+@@ -4357,7 +4359,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                         else
+                             kv_append(m.Kc, m.Vc, T, p0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
+                                       st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs,
+-                                      host_w, staged ? &m.stage : nullptr);
++                                      host_w, staged ? &m.stage : nullptr, st.storage);
+                         if (host_by_dma)
+                             strata::kernels::kv_unstage_to_host(pools_of(m.stage, m.ident_table), st.host,
+                                                                 core::qsa_kv_format(st), p0 / s.page_size,
+@@ -7717,7 +7719,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
+                             else
+                                 kv_append(m.Kc, m.Vc, T, p0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
+                                           st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, cs,
+-                                          host_w, staged ? &m.stage : nullptr);
++                                          host_w, staged ? &m.stage : nullptr, st.storage);
+                             if (host_by_dma)
+                                 strata::kernels::kv_unstage_to_host(pools_of(m.stage, m.ident_table), st.host,
+                                                                     core::qsa_kv_format(st), p0 / s.page_size,
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 6eea65a..98d875a 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -1042,8 +1042,8 @@ void usage() {
+                  "  --ple-inflight N     outstanding SSD reads (default 256)\n"
+                  "  --ple-delay-us U     fault injection: each row read completes no earlier than U us\n"
+                  "  --ple-sync-submit    A/B arm: submit table reads on the token thread (default: an I/O thread)\n"
+-                 "  --kv fp16|int8       KV storage (plan v0.3 P7): int8 codes + fp16 scale per 64 values, half the\n"
+-                 "                       VRAM; default fp16 until gate G-C accepts int8\n"
++                 "  --kv fp16|bf16|int8  KV storage (plan v0.3 P7): int8 codes + fp16 scale per 64 values, half the\n"
++                 "                       VRAM; bf16 is the CUDA prototype (no auto/DFlash2 yet)\n"
+                  "  --kv q4_0            4-bit K/V after a Hadamard rotation (PR #21): half of int8's memory,\n"
+                  "                       slightly lower precision (see bench/results/2026-09-27-kv-q4)\n"
+                  "  --kv k8v4            hybrid: INT8 K (exact attention scores) + rotated Q4_0 V, 816 B/cell\n"
+@@ -2275,7 +2275,39 @@ bool checkpoint_failure_is_survivable() {
+ /// Puts a checkpoint's running state back; the positional cells below it are the caller's to guarantee.
+ bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss, const strata::core::ModelGeometry& g) {
+     std::string error;
+-    if (strata::core::conversation_checkpoint_restore(c, ss, g, error)) return true;
++    if (strata::core::conversation_checkpoint_restore(c, ss, g, error)) {
++        if (std::getenv("STRATA_CHECKPOINT_READBACK") == nullptr) return true;
++        // Diagnostic only: compare the restored running state BEFORE any target
++        // arithmetic. A later decode can use different CPU/GPU expert placement.
++        // Keep the same bounded checkpoint allocation already budgeted for two
++        // concurrent checkpoints; never capture another copy of all KV pages.
++        ConvCheckpoint observed;
++        observed.ids = c.ids;
++        if (!strata::core::conversation_checkpoint_save(observed, ss, g, error)) {
++            std::fprintf(stderr, "strata serve: checkpoint readback: %s\n", error.c_str());
++            return false;
++        }
++        strata::core::conversation_checkpoint_join();
++        const bool gdn = observed.gdn == c.gdn, ple = observed.ple == c.ple;
++        const bool tails = observed.tails == c.tails, dead = observed.dead == c.dead;
++        const bool positions = observed.block_pos == c.block_pos;
++        const auto sizes = conv_state_sizes(g, ss);
++        std::vector<uint8_t> row(sizes.dead);
++        bool pooled = true;
++        for (int64_t j = 0; pooled && !c.ids.empty() && j < ss.qsa_alloc; ++j) {
++            const auto& st = ss.qsa_states[ss.qsa_ord0 + j];
++            const size_t at = c.ids.size() / strata::kernels::qsa_real_shapes().idx_block;
++            pooled = cudaMemcpy(row.data(), st.idx_pooled + at * g.idx_key_dim, row.size(), cudaMemcpyDefault) == cudaSuccess &&
++                     std::memcmp(row.data(), c.dead.data() + j * sizes.dead, row.size()) == 0;
++        }
++        const bool previous = ss.ple_prev[0] == (c.ids.size() >= 2 ? c.ids[c.ids.size()-2] : -1) &&
++                              ss.ple_prev[1] == (c.ids.empty() ? -1 : c.ids.back());
++        const bool ok = gdn && ple && tails && dead && positions && pooled && previous;
++        std::fprintf(stderr, "strata serve: CHECKPOINT_READBACK L=%zu gdn=%d ple=%d tails=%d dead=%d block_pos=%d pooled=%d ple_prev=%d bytes=%zu result=%s\n",
++                     c.ids.size(), gdn, ple, tails, dead, positions, pooled, previous,
++                     observed.gdn.size()+observed.ple.size()+observed.tails.size()+observed.dead.size()+observed.block_pos.size(), ok ? "PASS" : "FAIL");
++        return ok;
++    }
+     std::fprintf(stderr, "strata serve: checkpoint restore: %s\n", error.c_str());
+     return false;
+ }
+@@ -4330,10 +4362,33 @@ int main(int argc, char** argv) {
+         return 2;
+     }
+     if (o.kv == "q4") o.kv = "q4_0";
+-    if (o.kv != "fp16" && o.kv != "int8" && o.kv != "q4_0" && o.kv != "k8v4") {
+-        std::fprintf(stderr, "strata generate: --kv must be fp16, int8, q4_0 or k8v4\n");
++    strata::kernels::KvStorage requested_kv;
++    if (!strata::kernels::parse_kv_storage(o.kv.c_str(), requested_kv)) {
++        std::fprintf(stderr, "strata generate: --kv must be fp16, bf16, int8, q4_0 or k8v4\n");
+         return 2;
+     }
++    if (requested_kv == strata::kernels::KvStorage::Bf16) {
++#if !defined(STRATA_HAVE_BF16_KV)
++        std::fprintf(stderr,"BF16 KV: this prototype requires CUDA\n"); return 2;
++#endif
++        const char* grow = std::getenv("STRATA_KV_GROW");
++        const char* rot = std::getenv("STRATA_KV_ROT");
++        if(o.batch > 0 || multi_gpu ||
++           !o.layer_split.empty() || o.peer_device >= 0 || o.kv_grow || o.vram_elastic || o.native_flash_attn_short ||
++           (grow && grow[0] != '0') || (rot && rot[0] == '1')) {
++            std::fprintf(stderr,"BF16 KV: batch, multi-GPU, elastic, native short attention and rotated KV are unsupported; no fallback\n");
++            return 2;
++        }
++        if (o.draft_auto && (o.mtp.empty() || o.draft_model.empty() || o.spec < 2 || o.draft_fallback == "none")) {
++            std::fprintf(stderr,"BF16 KV auto requires both --mtp and --draft-model, --spec >= 2 and an MTP fallback; no fallback\n");
++            return 2;
++        }
++        std::fprintf(stderr,"BF16 KV prototype: direct FP32 RNE writers, BF16 pools, scalar FP32 attention\n");
++        if (o.draft == "dflash2")
++            std::fprintf(stderr,"KV precision contract: target=BF16, MTP=BF16 when loaded, DFlash2 ring=FP32 (independent); no FP16 KV fallback\n");
++    }
++    strata::kernels::configured_kv_storage = requested_kv == strata::kernels::KvStorage::Bf16
++        ? requested_kv : strata::kernels::KvStorage::Fp16;
+     strata::core::qsa_set_kv_int8(o.kv == "int8");
+     strata::core::qsa_set_kv_q4(o.kv == "q4_0");   // PR #21: 4-bit codes after a Hadamard rotation (kv_q4.hpp)
+     // STRATA_KV_ROT=1: INT8 K/V through the Hadamard rotation --kv q4_0 already uses. Opt-in: first-token KL to
+@@ -7214,6 +7269,9 @@ int main(int argc, char** argv) {
+         if (!o.mtp.empty()) mtp.set_ple_session(&ss);
+ #if defined(STRATA_HAVE_DFLASH2)
+         if (o.draft == "dflash2") {
++            if (!df2.set_target_kv_storage(requested_kv)) {
++                std::fprintf(stderr, "strata generate: %s\n", df2.state_error().c_str()); return 2;
++            }
+             const char* why = o.mtp.empty() && !df2_solo ? "it needs --mtp (the fallback) and --spec 2 or more"
+                               : !native_pack ? "it needs a native pack"
+                               : o.draft_auto && (!split_devs.empty() || o.batch > 0) ? "--draft auto (both drafters) is for one card and one request at a time; --draft dflash2 runs on a layer split"
+@@ -7247,7 +7305,8 @@ int main(int argc, char** argv) {
+                         const int cap = o.draft_cap > 0 ? o.draft_cap : strata::core::dflash2_auto_cap(uma, cc_major, cc_minor, card_bytes);
+                         if (cap > 0 && o.spec > cap) {
+                             std::fprintf(stderr, "strata generate: --draft dflash2: windows capped at %d tokens (%s; --draft-cap N changes it)\n", cap,
+-                                         o.draft_cap > 0 ? "as asked" : "the width measured best on this card");
++                                         o.draft_cap > 0 ? "as asked" : requested_kv == strata::kernels::KvStorage::Bf16
++                                             ? "upstream default; BF16 target performance is not yet measured" : "the width measured best on this card");
+                             o.spec = cap;
+                         }
+ #if !defined(STRATA_USE_HIP)
+@@ -7256,6 +7315,9 @@ int main(int argc, char** argv) {
+                                                  "(code prompts at a window of 6 gained 3%%); continuing as asked\n");
+ #endif
+                     }
++                } else if (requested_kv == strata::kernels::KvStorage::Bf16) {
++                    std::fprintf(stderr, "strata generate: BF16 target/DFlash2 FP32 startup failed: %s; requested drafter set is incomplete, no fallback\n", err.c_str());
++                    return 1;
+                 } else if (df2_solo) {
+                     std::fprintf(stderr, "strata generate: --draft dflash2 --draft-fallback none: %s. DFlash2 needs about 1.2 GiB of VRAM; there is no MTP to draft instead, so the start ends here%s\n",
+                                  err.c_str(), vram_free_note().c_str());
+@@ -7265,6 +7327,9 @@ int main(int argc, char** argv) {
+                                          "0.25 GiB, a draft head 0.2 GiB); start with --vram-reserve-mib 1900 to keep it (the expert cache then gives up about 2.5%% "
+                                          "of its experts to the CPU), or a smaller --max-context. The MTP drafts instead.\n", err.c_str());
+                 }
++            } else if (requested_kv == strata::kernels::KvStorage::Bf16) {
++                std::fprintf(stderr, "strata generate: BF16 target/DFlash2 FP32 unsupported: %s; no fallback\n", why);
++                return 1;
+             } else if (df2_solo) {
+                 std::fprintf(stderr, "strata generate: --draft dflash2 --draft-fallback none: DFlash2 is off here: %s; there is no MTP to draft instead, so the start ends here\n", why);
+                 return 1;
+@@ -11807,6 +11872,10 @@ int main(int argc, char** argv) {
+                 if (why_not.empty()) why_not = "the drafter could not be set up";
+             }
+             if (!why_not.empty()) {
++                if (requested_kv == strata::kernels::KvStorage::Bf16) {
++                    std::fprintf(stderr, "strata serve: BF16 target/DFlash2 FP32 binding/capture/staging failed: %s; no fallback\n", why_not.c_str());
++                    return 1;
++                }
+                 std::fprintf(stderr, "strata serve: --draft dflash2: %s. It needs about 1.2 GiB of VRAM in all (the pack 0.76 GiB, buffers and K/V ring 0.25 GiB, "
+                                      "a draft head 0.2 GiB, 0.1 GiB of prompt staging); --vram-reserve-mib 1900 keeps it. The MTP drafts instead.\n", why_not.c_str());
+                 if (df2_solo) {   // --draft-fallback none: there is no MTP to draft instead
+@@ -16793,7 +16862,10 @@ int main(int argc, char** argv) {
+             if (use_df2) {   // the drafter's ring goes on from the live conversation, or starts over (a parked or edited one)
+                 std::vector<int32_t> idv(ids.begin(), ids.end());
+                 bool cold = false;
+-                df2.begin_request(idv.data(), (int64_t) idv.size(), reread_to > 0 ? 0 : resume, &cold);
++                if (!df2.begin_request(idv.data(), (int64_t) idv.size(), reread_to > 0 ? 0 : resume, &cold)) {
++                    std::printf("ERR DFlash2 state preparation failed: %s\n", df2.state_error().c_str());
++                    return 1;
++                }
+                 if (df2.last_rebuilt > 0)
+                     std::fprintf(stderr, "strata serve: DFlash2: %s%lld context rows of the window rebuilt from the drafter's log in %.1f ms%s\n",
+                                  df2.last_swapped ? "a parked conversation came back: " : "", (long long) df2.last_rebuilt, df2.last_ms,
+@@ -20534,11 +20606,17 @@ int main(int argc, char** argv) {
+         }
+ #if defined(STRATA_HAVE_DFLASH2)
+         if (use_df2 && !ver.tapping()) {
++            if (requested_kv == strata::kernels::KvStorage::Bf16) {
++                std::fprintf(stderr, "strata generate: BF16 target/DFlash2 FP32 requires verifier taps; no fallback\n"); return 1;
++            }
+             std::fprintf(stderr, "strata generate: --draft dflash2: the verifier keeps no taps here; the MTP drafts instead\n");
+             use_df2 = false;
+         }
+         if (use_df2) df2_offer_head();
+         if (use_df2 && !df2.bind(wt, &native_head, df2_vocab_path(), err)) {
++            if (requested_kv == strata::kernels::KvStorage::Bf16) {
++                std::fprintf(stderr, "strata generate: BF16 target/DFlash2 FP32 binding failed: %s; no fallback\n", err.c_str()); return 1;
++            }
+             std::fprintf(stderr, "strata generate: --draft dflash2: %s. It needs about 1.2 GiB of VRAM in all (the pack 0.76 GiB, buffers and K/V ring "
+                                  "0.25 GiB, a draft head 0.2 GiB); --vram-reserve-mib 1900 keeps it (the expert cache gives up about 2.5%% of its experts "
+                                  "to the CPU). The MTP drafts instead.\n", err.c_str());
+@@ -20546,6 +20624,9 @@ int main(int argc, char** argv) {
+         }
+         if (use_df2) df2.set_max_drafts((o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec) - 1);   // the widest window - 1: the head and the walk run for that many rows
+         if (use_df2 && !df2.prepare(ver.tap_dev(), err)) {
++            if (requested_kv == strata::kernels::KvStorage::Bf16) {
++                std::fprintf(stderr, "strata generate: BF16 target/DFlash2 FP32 graph preparation failed: %s; no fallback\n", err.c_str()); return 1;
++            }
+             std::fprintf(stderr, "strata generate: --draft dflash2: %s. It needs about 1.2 GiB of VRAM in all (the pack 0.76 GiB, buffers and K/V ring "
+                                  "0.25 GiB, a draft head 0.2 GiB); --vram-reserve-mib 1900 keeps it (the expert cache gives up about 2.5%% of its experts "
+                                  "to the CPU). The MTP drafts instead.\n", err.c_str());
+diff --git a/tools/test_bf16_fail_closed.py b/tools/test_bf16_fail_closed.py
+new file mode 100644
+index 0000000..a828435
+--- /dev/null
++++ b/tools/test_bf16_fail_closed.py
+@@ -0,0 +1,33 @@
++#!/usr/bin/env python3
++"""Negative engine/kernel tests; invalid configurations must fail before reading a pack."""
++import subprocess
++import sys
++
++engine, kernels = sys.argv[1:]
++base=[engine,'--pack','/does-not-exist-bf16-negative-test','--tokens','1']
++cases=[
++    ([kernels,'--bad-dtype'],'invalid dtype/geometry/pools'),
++    ([kernels,'--bad-stream-format'],'invalid/mismatched dtype'),
++    (base+['--kv','not-a-format'],'--kv must be'),
++    (base+['--kv','bf16','--draft','auto'],'BF16 KV auto requires both'),
++    (base+['--kv','bf16','--kv-grow'],'unsupported; no fallback'),
++    (base+['--kv','bf16','--batch','2'],'unsupported; no fallback'),
++    (base+['--kv','bf16','--native-flash-attn-short'],'unsupported; no fallback'),
++]
++for cmd,message in cases:
++    p=subprocess.run(cmd,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=30)
++    print('COMMAND',cmd,'RETURN',p.returncode,flush=True)
++    print(p.stdout,flush=True)
++    assert p.returncode==2 and message in p.stdout,(p.returncode,message)
++    assert 'cannot open' not in p.stdout.lower(), 'reached model loading before config refusal'
++# A complete drafter selection passes the BF16 precision gate, then the deliberately
++# absent PLE option stops it before GPU probing or any model loading.
++p=subprocess.run(base+['--kv','bf16','--draft','auto','--mtp','/does-not-exist-mtp',
++                       '--draft-model','/does-not-exist-dflash2','--spec','8'],
++                 text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=30)
++print('POSITIVE PRECISION CONFIG RETURN',p.returncode,flush=True)
++print(p.stdout,flush=True)
++assert p.returncode==2 and 'KV precision contract: target=BF16, MTP=BF16' in p.stdout
++assert 'DFlash2 ring=FP32 (independent)' in p.stdout and '--ple-gguf is required' in p.stdout
++assert 'PCIe probe' not in p.stdout and 'cannot open' not in p.stdout.lower()
++print('PASS precision configuration, fail-closed dtype and unsupported combinations; no model was loaded')
+diff --git a/tools/test_dflash2_bf16.py b/tools/test_dflash2_bf16.py
+new file mode 100644
+index 0000000..bf652e4
+--- /dev/null
++++ b/tools/test_dflash2_bf16.py
+@@ -0,0 +1,56 @@
++#!/usr/bin/env python3
++"""Generate a ~62 MiB sparse synthetic context-only DF2P fixture; no model assets.
++The file deliberately omits block/head tensors and cannot run draft inference.
++"""
++import hashlib
++from pathlib import Path
++import struct
++import subprocess
++import sys
++import tempfile
++
++
++def fixture(path):
++    tensors = []
++    def q8(name, rows, cols):
++        data = bytearray(rows * cols // 32 * 34)
++        for r in range(rows):
++            col = (r * 19 + 11) % cols
++            off = (r * (cols // 32) + col // 32) * 34
++            struct.pack_into('<e', data, off, 0.03125)
++            data[off + 2 + col % 32] = 1 + r % 7
++        tensors.append((name, 'q8_0', rows, cols, data))
++    def norm(name, count):
++        tensors.append((name, 'f32', 1, count, struct.pack('<f', 1.) * count))
++    q8('fc.weight', 2560, 12800)
++    norm('hidden_norm.weight', 2560)
++    for layer in range(5):
++        for kind in ('k', 'v'):
++            q8(f'layers.{layer}.self_attn.{kind}_proj.weight', 1024, 2560)
++        norm(f'layers.{layer}.self_attn.k_norm.weight', 128)
++    index = 'cfg taps 5,15,25,35,45\n'
++    off = 0
++    for name, dtype, rows, cols, data in tensors:
++        index += f't {name} {dtype} {rows} {cols} {off} {len(data)}\n'
++        off += len(data)
++    index = index.encode()
++    with open(path, 'wb') as f:
++        f.write(b'DF2P' + struct.pack('<II', 1, len(index)) + index)
++        for *_, data in tensors:
++            f.write(data)
++    with path.open('rb') as fixture_file:
++        digest = hashlib.file_digest(fixture_file, 'sha256').hexdigest()
++    print(f'SYNTHETIC CONTEXT-ONLY fixture bytes={path.stat().st_size} sha256={digest}', flush=True)
++
++
++if __name__ == '__main__':
++    with tempfile.TemporaryDirectory(prefix='strata-df2-synthetic-') as td:
++        path = Path(td) / 'context-only.df2p'
++        fixture(path)
++        # Optional sanitizer prefix is passed before --binary.
++        args = sys.argv[1:]
++        split = args.index('--binary')
++        prefix, binary = args[:split], args[split + 1]
++        mode = [] if '--legacy' in args[split + 2:] else ['--bf16']
++        if '--race-smoke' in args[split + 2:]: mode.append('--race-smoke')
++        subprocess.run(prefix + [binary, str(path), '0'] + mode, check=True)

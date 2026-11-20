@@ -1,0 +1,28 @@
+name: Build the SM120 engine and CPU vision encoder
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  compile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    container: nvidia/cuda:13.0.2-devel-ubuntu24.04
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git file ca-certificates build-essential g++-13 cmake ninja-build python3
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: ./scripts/source.sh
+      - run: ./scripts/build.sh
+        env:
+          CUDA_HOME: /usr/local/cuda
+          CXX: /usr/bin/g++-13
+          BUILD_JOBS: "2"
+      - name: Inspect artifacts
+        run: |
+          cd bin
+          sha256sum --check SHA256SUMS
+          file strata strata-vision

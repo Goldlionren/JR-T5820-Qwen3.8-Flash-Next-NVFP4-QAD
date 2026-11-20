@@ -1,0 +1,38 @@
+[Unit]
+Description=Strata FP4-Local native API
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+WorkingDirectory=@ROOT@
+Environment=PYTHONUNBUFFERED=1
+Environment="TMPDIR=@ROOT@/runtime"
+Environment=STRATA_MAX_BODY_MIB=48
+Environment=STRATA_KEEP_EMPTY_TURNS=1
+Environment=STRATA_PF_GROUP_SCRATCH=1
+UnsetEnvironment=STRATA_DEBUG
+LoadCredential=api.key:@ROOT@/secrets/api.key
+ExecStartPre=/usr/bin/python3 "@ROOT@/scripts/assets.py" check
+ExecStart=/usr/bin/flock --no-fork --nonblock "@ROOT@/runtime/model.lock" /usr/bin/python3 "@ROOT@/scripts/native.py" serve
+ExecStartPost=-/usr/bin/python3 "@ROOT@/scripts/native.py" preload
+MemoryMax=85G
+MemorySwapMax=0
+CPUQuota=2000%
+CPUAffinity=@CPUS@
+OOMPolicy=kill
+TasksMax=1024
+Restart=on-failure
+RestartSec=5
+RestartSteps=5
+RestartMaxDelaySec=300
+TimeoutStartSec=660
+TimeoutStopSec=180
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths="@ROOT@/runtime"
+
+[Install]
+WantedBy=default.target

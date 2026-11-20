@@ -1,0 +1,14 @@
+diff --git a/serve/server.py b/serve/server.py
+index fbd5354..63045d2 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -8739,6 +8739,9 @@ def make_handler(svc: Service):
+                 items.close()
+ 
+         def _openai(self, req):
++            # Preserve this deployment's published model identity, as Responses does.
++            if req.get("model", svc.model) not in svc.model_names():
++                raise ValueError("unknown model ID")
+             req = svc.with_shared(req, "openai")
+             bias_api.normalize(req.get("logit_bias"), len(getattr(svc.tok, "tokens", ())) or None)
+             messages, tools, kw = openai_to_messages(req)

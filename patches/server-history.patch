@@ -1,0 +1,45 @@
+--- a/serve/frontend.py
++++ b/serve/frontend.py
+@@ -590,6 +590,10 @@
+             out["_call_id"] = m.get("tool_call_id")
+         if m.get("reasoning_content"):
+             out["reasoning_content"] = m["reasoning_content"]
++        elif (role == "assistant" and "reasoning_content" not in m
++              and isinstance(m.get("reasoning"), str) and m["reasoning"]):
++            # OpenAI-compatible local clients may echo the reasoning delta under this name.
++            out["reasoning_content"] = m["reasoning"]
+         if m.get("tool_calls"):
+             calls = []
+             for c in _object_list(m["tool_calls"], "tool_calls"):
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -6782,6 +6782,8 @@
+                                 # the request's whole prompt, and the tokens read of it (None: an older engine)
+                                 "prompt_total": len(ids), "prompt_read": last.get("prompt_read"),
+                                 "reasoning_recoveries": recovery_count,
++                                "reasoning_tokens": thinking_n,
++                                "last_assistant_reasoning_field": last_assistant_reasoning_field(sampling),
+                                 "reasoning_repeat_coverage": round(repeat_coverage, 3),
+                                 "engine_generated": last.get("generated"),
+                                 "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
+@@ -6943,6 +6945,20 @@
+         return round(produced / (decode_ms / 1000), 1)
+     if generated and wall_s is not None and wall_s >= RATE_MIN_SPAN_S:
+         return round(generated / wall_s, 1)
++    return None
++
++
++def last_assistant_reasoning_field(request):
++    """Name of the reasoning field on the last assistant message, for cache diagnostics."""
++    messages = (request or {}).get("messages")
++    if not isinstance(messages, list):
++        return None
++    for msg in reversed(messages):
++        if isinstance(msg, dict) and msg.get("role") == "assistant":
++            for field in ("reasoning_content", "reasoning"):
++                if field in msg:
++                    return field if isinstance(msg[field], str) and msg[field] else "empty_or_nontext"
++            return "omitted"
+     return None
+ 
+ 
