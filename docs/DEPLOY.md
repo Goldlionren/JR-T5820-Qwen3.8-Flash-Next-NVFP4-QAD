@@ -23,7 +23,7 @@ df -h "$HOME"
 ```bash
 git clone https://github.com/Goldlionren/JR-T5820-Qwen3.8-Flash-Next-NVFP4-QAD.git strata-fp4-local
 cd strata-fp4-local
-git checkout t5820-fp4local-prefill-20261121
+git checkout t5820-fp4local-long-prefill-20261124
 ./scripts/source.sh
 ./scripts/python-env.sh
 BUILD_JOBS=2 ./scripts/build.sh

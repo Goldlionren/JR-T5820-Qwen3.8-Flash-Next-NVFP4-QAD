@@ -71,6 +71,12 @@ class InstallTests(unittest.TestCase):
         for key,val in {"--pool-workers":"18","--max-context":"262144","--kv":"bf16",
                         "--spec":"4","--spec-min-p":"0.65","--conversation-cache-mib":"5120"}.items():
             self.assertEqual(flags[flags.index(key)+1],val)
+        for key, value in {"STRATA_BF16_PREFILL_GROUP_WARPS":"1", "STRATA_NEXT_LAYER_STAGING":"1",
+                           "STRATA_PREFILL_ROUTED_STREAM":"1", "STRATA_PREFILL_LEND_PCT":"95",
+                           "STRATA_PREFILL_CPU_SHARE_MAX":"8192", "STRATA_PREFILL_CPU_SHARE_NT":"64"}.items():
+            self.assertEqual(cfg["env"][key], value)
+        self.assertEqual(cfg["model_name"], "t5820-strata-qwen3.8-fp4-local-qad-bf16-256k")
+        self.assertIn("t5820-strata-qwen3.8-fp4-local-qad-int8-256k", cfg["aliases"])
         self.assertEqual(cfg["host"],"127.0.0.1")
         unit=(root/"config/service.in").read_text().splitlines()
         for line in ["MemoryMax=85G","MemorySwapMax=0","Environment=STRATA_PF_GROUP_SCRATCH=1",

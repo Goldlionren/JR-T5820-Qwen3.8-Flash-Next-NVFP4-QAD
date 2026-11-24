@@ -16,6 +16,8 @@ checkout() {
 checkout "$tmp/src" https://github.com/Niko1221/Strata.git "$base"
 git -C "$tmp/src" apply --index "$PWD/patches/engine.patch"
 test "$(git -C "$tmp/src" write-tree)" = c4a123a442cecfca881967fb1f426da9ea7ee6c3
+git -C "$tmp/src" apply --index "$PWD/patches/long-prefill.patch"
+test "$(git -C "$tmp/src" write-tree)" = 1b88de958f5a7945f9b70576a86a21a19e866dcb
 for patch in server-model server-history; do
     git -C "$tmp/src" apply "$PWD/patches/$patch.patch"
 done

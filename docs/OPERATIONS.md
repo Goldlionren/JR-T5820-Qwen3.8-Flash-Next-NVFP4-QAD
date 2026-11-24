@@ -38,6 +38,10 @@ python3 scripts/native.py status
 - **并发与多模态**：parallel、max_queue、queue_timeout、vision、最长静默等待和采样均为原生 Server 字段。增加并发会改变 KV 和显存预算。
 - **控制向量**：`scripts/strata-cvec status`、`scripts/strata-cvec off`、`scripts/strata-cvec on`。On 加载上游固定向量（project，1.0，4–44 层）；Off 卸载向量。开关保存其他已编辑参数，按原生状态检查 READY；失败时恢复切换前配置。客户端需在切换期间保持暂停。切换前的配置位于 runtime/before-cvec.json。若只想对单个请求切换已加载的向量，可用原生 `experimental_speed_projection` 布尔字段。
 
+## 在两个引擎之间切换
+
+当前默认源为 `b035c1e`。保留的候选 `5488495` 可在独立目录检出标签 `t5820-fp4local-prefill-20261121`，按该标签的源码提取和构建步骤生成引擎。使用已有安装进行切换时，先暂停客户端新请求并确认活动和队列均为零。备份正在使用的二进制、`bin/SHA256SUMS` 和 `strata.json`，然后停同一个 user service。从目标安装复制匹配的引擎，保留本站模型路径、主模型 ID、兼容别名及密钥。按目标标签的模板设置六个长文 Prefill 环境项（旧版删除这六项），在 bin 目录重新记录并检查两个程序的 SHA256，再启动原服务并检查 READY。切回时恢复一并保存的引擎、摘要清单和配置。开机沿用已注册的 unit。
+
 ## 诊断与回退
 
 ```bash

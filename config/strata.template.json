@@ -83,10 +83,16 @@
     "STRATA_BF16_ATTENTION_WARP": "1",
     "STRATA_PCIE_ROW_PRIORITY": "1",
     "STRATA_ADAPT_OVERLAP": "1",
-    "STRATA_ADAPT_OVERLAP_RESIDENT": "1"
+    "STRATA_ADAPT_OVERLAP_RESIDENT": "1",
+    "STRATA_BF16_PREFILL_GROUP_WARPS": "1",
+    "STRATA_NEXT_LAYER_STAGING": "1",
+    "STRATA_PREFILL_ROUTED_STREAM": "1",
+    "STRATA_PREFILL_LEND_PCT": "95",
+    "STRATA_PREFILL_CPU_SHARE_MAX": "8192",
+    "STRATA_PREFILL_CPU_SHARE_NT": "64"
   },
   "tokenizer": "@ROOT@/prepared/pack/tokenizer",
-  "model_name": "t5820-strata-qwen3.8-fp4-local-qad-int8-256k",
+  "model_name": "t5820-strata-qwen3.8-fp4-local-qad-bf16-256k",
   "backend": "cuda",
   "arch": "qwen4exp",
   "vision": {
@@ -116,7 +122,8 @@
   "host": "127.0.0.1",
   "aliases": [
     "t5820-strata-qwen3.8-iq3s-bf16-256k",
-    "t5820-strata-qwen3.8-nvfp4-bf16-256k"
+    "t5820-strata-qwen3.8-nvfp4-bf16-256k",
+    "t5820-strata-qwen3.8-fp4-local-qad-int8-256k"
   ],
   "draft_vocab": "cjk"
 }

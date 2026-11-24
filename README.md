@@ -4,6 +4,8 @@
 
 模型采用 NVIDIA Qwen3.8-Flash-Next FP4-Local QAD。权重转换、NVFP4 PLE、MTP、会话缓存以及支持 SSE、Thinking、工具和图片的原生 API 来自 Strata。下面的引擎和协议改动以本仓库锁定的上游提交 `13eedf55` 为对照。[上游源码](https://github.com/Niko1221/Strata/tree/13eedf552417a6a791a7d13c6597e24300ee3a09)
 
+当前生产引擎为 **`b035c1e`**，重点缩短读入长材料和工具结果的等待。在参考 T5820 的固定四轮任务中，客户端平均耗时从 93.05 秒降到 74.06 秒。旧引擎 `5488495` 保留为可独立部署的候选。[实测、配置与旧版标签](docs/BASELINE.md)
+
 ## 这个派生版改了什么
 
 - **长上下文的真 BF16 KV。** 我们补上了 FP32 直接舍入到 BF16 的写入路径，以及 CUDA Attention、主存与显存之间的分页传输和会话快照对 BF16 的支持。解码时，多个 CUDA 线程块并行读取选中的 KV，再用 FP32 合并结果。主模型和 MTP 都能使用这条路径。补丁附有 BF16 原始位模式与分页回归测试。[引擎补丁](patches/engine.patch)

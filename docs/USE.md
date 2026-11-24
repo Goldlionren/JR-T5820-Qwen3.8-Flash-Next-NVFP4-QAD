@@ -2,7 +2,7 @@
 
 在仓库根目录用 `python3 scripts/native.py status` 检查 loaded，`python3 scripts/native.py models` 查看模型 ID，`python3 scripts/native.py smoke` 发送一次短文本请求。status 和 models 不生成 token。
 
-Hermes 中选择 OpenAI-compatible Chat Completions provider。Base URL 为 `http://<服务地址>:10001/v1`，API Key 从本机 secrets/api.key 交给受信任客户端。兼容 Model ID 为 `t5820-strata-qwen3.8-iq3s-bf16-256k`。名字中的 iq3s、主 ID 中的 int8 都是历史命名，当前实际加载 FP4-Local QAD 和 BF16 KV。与原站点迁移时只有继续保留地址、端口和同一个密钥才能让现有客户端直接使用。
+Hermes 中选择 OpenAI-compatible Chat Completions provider。Base URL 为 `http://<服务地址>:10001/v1`，API Key 从本机 secrets/api.key 交给受信任客户端。兼容 Model ID 为 `t5820-strata-qwen3.8-iq3s-bf16-256k`。正式主 ID 为 `t5820-strata-qwen3.8-fp4-local-qad-bf16-256k`。原有 IQ3_S、NVFP4 和 INT8 名称均保留为兼容别名。与原站点迁移时只有继续保留地址、端口和同一个密钥才能让现有客户端直接使用。
 
 以下示例在服务机本地使用默认监听地址执行。密钥通过 curl 的标准输入传入，避免出现在命令行参数中。SSE 客户端分别处理 reasoning_content、content 和 tool_calls；流式工具参数须按调用索引拼接后再解析 JSON。
 
